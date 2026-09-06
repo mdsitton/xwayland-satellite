@@ -247,6 +247,10 @@ struct PopupData {
     popup: XdgPopup,
     positioner: XdgPositioner,
     xdg: XdgSurfaceData,
+    /// Origin of the positioner's anchor rect within the parent's window geometry, i.e. where
+    /// the parent's X window content starts. This is non-zero when satellite draws the parent's
+    /// titlebar, which is part of the parent's window geometry but not of its X window.
+    anchor_origin: (i32, i32),
 }
 
 trait Event {
@@ -1595,6 +1599,23 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             xdg.id()
         );
 
+        let (parent_width, parent_height) =
+            event::logical_size(parent_dims.width, parent_dims.height, initial_scale);
+        // Popups are positioned relative to the parent's window geometry, which includes the
+        // titlebar satellite draws above the X window. Anchor to the X window's area instead.
+        let anchor_origin = match parent_role {
+            SurfaceRole::Toplevel(Some(toplevel))
+                if toplevel
+                    .decoration
+                    .satellite
+                    .as_ref()
+                    .is_some_and(|d| d.will_draw_decorations(parent_width)) =>
+            {
+                (0, DecorationsDataSatellite::TITLEBAR_HEIGHT)
+            }
+            _ => (0, 0),
+        };
+
         let positioner = self.xdg_wm_base.create_positioner(&self.qh, ());
         positioner.set_size(
             1.max((window.attrs.dims.width as f64 / initial_scale) as i32),
@@ -1606,10 +1627,10 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         positioner.set_anchor(Anchor::TopLeft);
         positioner.set_gravity(Gravity::BottomRight);
         positioner.set_anchor_rect(
-            0,
-            0,
-            (parent_window.attrs.dims.width as f64 / initial_scale) as i32,
-            (parent_window.attrs.dims.height as f64 / initial_scale) as i32,
+            anchor_origin.0,
+            anchor_origin.1,
+            parent_width,
+            parent_height,
         );
         positioner
             .set_constraint_adjustment(ConstraintAdjustment::SlideX | ConstraintAdjustment::SlideY);
@@ -1623,6 +1644,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         PopupData {
             popup,
             positioner,
+            anchor_origin,
             xdg: XdgSurfaceData {
                 surface: xdg,
                 configured: false,

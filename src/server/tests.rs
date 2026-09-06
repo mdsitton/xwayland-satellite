@@ -828,9 +828,11 @@ impl TestFixture<FakeXConnection> {
                 assert_eq!(
                     pos.anchor_rect.as_ref().unwrap(),
                     &testwl::Rect {
+                        // The anchor rect is the parent's logical size, rounded up like its
+                        // viewport.
                         size: testwl::Vec2 {
-                            x: (parent_win.dims.width as f64 / scale) as i32,
-                            y: (parent_win.dims.height as f64 / scale) as i32
+                            x: (parent_win.dims.width as f64 / scale).ceil() as i32,
+                            y: (parent_win.dims.height as f64 / scale).ceil() as i32
                         },
                         offset: testwl::Vec2::default()
                     }
@@ -3181,6 +3183,122 @@ fn client_side_decorations_fractional_scale() {
             "viewport size at scale {scale}"
         );
     }
+}
+
+#[test]
+fn popup_under_satellite_decorations() {
+    // The titlebar drawn by satellite is part of the parent's window geometry, so popups must
+    // be anchored below it, and their configured position converted back to X coordinates
+    // relative to the parent's X window.
+    let (mut f, compositor) = TestFixture::new_with_compositor();
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&compositor, window);
+    f.testwl
+        .force_decoration_mode(id, zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+    let parent_dims = f.connection().window(window).dims;
+    assert_eq!((parent_dims.width, parent_dims.height), (100, 75));
+
+    let popup = Window::new(2);
+    let (_, p_id) = f.create_popup(
+        &compositor,
+        PopupBuilder::new(popup, window, id)
+            .x(10)
+            .y(20)
+            .check_size_and_pos(false),
+    );
+    let data = f.testwl.get_surface_data(p_id).unwrap();
+    let pos = &data.popup().positioner_state;
+    assert_eq!(
+        pos.anchor_rect,
+        Some(testwl::Rect {
+            size: testwl::Vec2 { x: 100, y: 75 },
+            offset: testwl::Vec2 {
+                x: 0,
+                y: super::decoration::DecorationsDataSatellite::TITLEBAR_HEIGHT
+            }
+        })
+    );
+    assert_eq!(pos.offset, testwl::Vec2 { x: 10, y: 20 });
+    f.assert_window_dimensions(
+        popup,
+        p_id,
+        WindowDims {
+            x: 10,
+            y: 20,
+            width: 50,
+            height: 50,
+        },
+    );
+
+    // Without decorations (fullscreen parent) the anchor is the whole parent.
+    f.testwl
+        .configure_toplevel(id, 100, 100, vec![xdg_toplevel::State::Fullscreen]);
+    f.run();
+    let popup2 = Window::new(3);
+    let (_, p2_id) = f.create_popup(
+        &compositor,
+        PopupBuilder::new(popup2, window, id).x(10).y(20),
+    );
+    let data = f.testwl.get_surface_data(p2_id).unwrap();
+    assert_eq!(
+        data.popup()
+            .positioner_state
+            .anchor_rect
+            .as_ref()
+            .unwrap()
+            .offset,
+        testwl::Vec2 { x: 0, y: 0 }
+    );
+}
+
+#[test]
+fn popup_under_satellite_decorations_fractional_scale() {
+    // The anchor area is the parent's logical content size, rounded the same way as its viewport.
+    let mut f = TestFixture::new_pre_connect(|testwl| {
+        testwl.enable_fractional_scale();
+    });
+    let compositor = f.compositor();
+    let (_, output) = f.new_output(0, 0);
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&compositor, window);
+    let data = f.testwl.get_surface_data(id).unwrap();
+    data.fractional
+        .as_ref()
+        .expect("Missing fractional scale")
+        .preferred_scale(180); // 1.5 scale
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+    f.run();
+    f.testwl
+        .force_decoration_mode(id, zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+    f.run();
+    let dims = f.connection().window(window).dims;
+    assert_eq!((dims.width, dims.height), (150, 112));
+
+    let popup = Window::new(2);
+    let (_, p_id) = f.create_popup(
+        &compositor,
+        PopupBuilder::new(popup, window, id)
+            .x(15)
+            .y(30)
+            .scale(1.5)
+            .check_size_and_pos(false),
+    );
+    let data = f.testwl.get_surface_data(p_id).unwrap();
+    assert_eq!(
+        data.popup().positioner_state.anchor_rect,
+        Some(testwl::Rect {
+            size: testwl::Vec2 { x: 100, y: 75 },
+            offset: testwl::Vec2 {
+                x: 0,
+                y: super::decoration::DecorationsDataSatellite::TITLEBAR_HEIGHT
+            }
+        })
+    );
 }
 
 #[test]
