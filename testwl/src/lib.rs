@@ -383,9 +383,18 @@ impl State {
         let Some(SurfaceRole::Popup(p)) = &mut surface.role else {
             panic!("Surface does not have popup role: {:?}", surface.role);
         };
-        let PositionerState { size, offset, .. } = &p.positioner_state;
+        let PositionerState {
+            size,
+            offset,
+            anchor_rect,
+            ..
+        } = &p.positioner_state;
         let size = size.unwrap();
-        p.popup.configure(offset.x, offset.y, size.x, size.y);
+        // The popup's position is relative to the parent's window geometry, which is where the
+        // anchor rect is placed.
+        let anchor = anchor_rect.as_ref().map(|r| r.offset).unwrap_or_default();
+        p.popup
+            .configure(anchor.x + offset.x, anchor.y + offset.y, size.x, size.y);
         p.xdg.configure(self.configure_serial);
         self.configure_serial += 1;
     }

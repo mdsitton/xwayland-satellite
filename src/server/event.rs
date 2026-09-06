@@ -300,8 +300,16 @@ impl SurfaceEvents {
             let (scale_factor, window, window_data, role) = query.get().unwrap();
 
             let window = *window;
-            let x = (pending.x.max(0) as f64 * scale_factor.0) as i32 + window_data.output_offset.x;
-            let y = (pending.y.max(0) as f64 * scale_factor.0) as i32 + window_data.output_offset.y;
+            // Popup positions are relative to the parent's window geometry; make them relative
+            // to the parent's X window (see PopupData::anchor_origin).
+            let (anchor_x, anchor_y) = match role {
+                SurfaceRole::Popup(Some(popup)) => popup.anchor_origin,
+                _ => (0, 0),
+            };
+            let x = ((pending.x - anchor_x).max(0) as f64 * scale_factor.0) as i32
+                + window_data.output_offset.x;
+            let y = ((pending.y - anchor_y).max(0) as f64 * scale_factor.0) as i32
+                + window_data.output_offset.y;
             let width = if pending.width > 0 {
                 (pending.width as f64 * scale_factor.0) as u16
             } else {
@@ -311,7 +319,7 @@ impl SurfaceEvents {
                 let mut logical_height = pending.height;
                 if let SurfaceRole::Toplevel(Some(toplevel)) = role {
                     if let Some(d) = &toplevel.decoration.satellite {
-                        let surface_width = (width as f64 / scale_factor.0).ceil() as i32;
+                        let (surface_width, _) = logical_size(width, 0, scale_factor.0);
                         if d.will_draw_decorations(surface_width) {
                             logical_height = (logical_height
                                 - DecorationsDataSatellite::TITLEBAR_HEIGHT)
@@ -470,6 +478,17 @@ impl SurfaceEvents {
     }
 }
 
+/// Converts a size in X pixels to the surface's logical size at the given scale, rounding up so
+/// that the whole buffer is shown. The viewport and a popup's positioner both describe the same
+/// surface, so both must derive their logical size this way or they disagree at fractional
+/// scales.
+pub(super) fn logical_size(width: u16, height: u16, scale: f64) -> (i32, i32) {
+    (
+        (width as f64 / scale).ceil() as i32,
+        (height as f64 / scale).ceil() as i32,
+    )
+}
+
 pub(super) fn update_surface_viewport(
     world: &World,
     mut surface_query: hecs::QueryOne<(
@@ -484,8 +503,7 @@ pub(super) fn update_surface_viewport(
     let dims = &window_data.attrs.dims;
     let size_hints = &window_data.attrs.size_hints;
 
-    let width = (dims.width as f64 / scale_factor.0).ceil() as i32;
-    let height = (dims.height as f64 / scale_factor.0).ceil() as i32;
+    let (width, height) = logical_size(dims.width, dims.height, scale_factor.0);
     if width > 0 && height > 0 {
         viewport.set_destination(width, height);
     }
