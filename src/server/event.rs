@@ -300,8 +300,16 @@ impl SurfaceEvents {
             let (scale_factor, window, window_data, role) = query.get().unwrap();
 
             let window = *window;
-            let x = (pending.x.max(0) as f64 * scale_factor.0) as i32 + window_data.output_offset.x;
-            let y = (pending.y.max(0) as f64 * scale_factor.0) as i32 + window_data.output_offset.y;
+            // Popup positions are relative to the parent's window geometry; make them relative
+            // to the parent's X window (see PopupData::anchor_origin).
+            let (anchor_x, anchor_y) = match role {
+                SurfaceRole::Popup(Some(popup)) => popup.anchor_origin,
+                _ => (0, 0),
+            };
+            let x = ((pending.x - anchor_x).max(0) as f64 * scale_factor.0) as i32
+                + window_data.output_offset.x;
+            let y = ((pending.y - anchor_y).max(0) as f64 * scale_factor.0) as i32
+                + window_data.output_offset.y;
             let width = if pending.width > 0 {
                 (pending.width as f64 * scale_factor.0) as u16
             } else {
