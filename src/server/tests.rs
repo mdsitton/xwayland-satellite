@@ -4561,6 +4561,305 @@ fn popup_newer_x_resize_survives_the_older_reply_being_applied() {
 }
 
 #[test]
+fn decoration_hover_redraw_applies_independently() {
+    // The titlebar is a synchronized sub-surface, so its commits only take effect with the
+    // parent's. Hovering the close button must not wait for the X client to repaint: that
+    // redraw is committed desynchronized, and the mode is restored afterwards so resizes stay
+    // in step with the window.
+    let (mut f, compositor) = TestFixture::new_with_compositor();
+    let _pointer = TestObject::<WlPointer>::from_request(
+        &compositor.seat.obj,
+        wl_seat::Request::GetPointer {},
+    );
+    let window = Window::new(1);
+    let (surface, id) = f.create_toplevel(&compositor, window);
+    f.testwl
+        .force_decoration_mode(id, zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+    let subsurface_id = f.testwl.last_created_surface_id().unwrap();
+    assert_ne!(subsurface_id, id);
+    {
+        let data = f.testwl.get_surface_data(subsurface_id).unwrap();
+        let Some(SurfaceRole::Subsurface(sub)) = &data.role else {
+            panic!("not a subsurface: {:?}", data.role);
+        };
+        assert!(sub.sync);
+        assert_eq!(
+            sub.last_commit_sync,
+            Some(true),
+            "resize commit is synchronized"
+        );
+    }
+
+    // Enter the titlebar away from the close button, then move onto it.
+    f.testwl.move_pointer_to(subsurface_id, 50.0, 10.0);
+    f.run();
+    f.testwl.pointer_motion(90.0, 10.0);
+    f.run();
+    let data = f.testwl.get_surface_data(subsurface_id).unwrap();
+    let Some(SurfaceRole::Subsurface(sub)) = &data.role else {
+        panic!("not a subsurface: {:?}", data.role);
+    };
+    assert_eq!(
+        sub.last_commit_sync,
+        Some(false),
+        "hover redraw is committed desynchronized"
+    );
+    assert!(sub.sync, "synchronized mode is restored");
+    assert!(data.last_damage.is_some(), "close button was redrawn");
+    assert_eq!(sub.desync_requests, 1);
+
+    // A resize from the X side redraws the titlebar synchronized, waiting for the window's
+    // new contents. Until then hover changes must not desynchronize, or the new titlebar
+    // size would show before the window.
+    f.reconfigure_window(
+        window,
+        WindowDims {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 100,
+        },
+        false,
+    );
+    f.run();
+    f.run();
+    f.testwl.pointer_motion(100.0, 10.0); // off the button (it moved with the width)
+    f.run();
+    f.testwl.pointer_motion(190.0, 10.0); // back on it
+    f.run();
+    {
+        let data = f.testwl.get_surface_data(subsurface_id).unwrap();
+        let Some(SurfaceRole::Subsurface(sub)) = &data.role else {
+            panic!("not a subsurface: {:?}", data.role);
+        };
+        assert_eq!(sub.last_commit_sync, Some(true), "joins the pending resize");
+        assert_eq!(
+            sub.desync_requests, 1,
+            "no desync while a resize is pending"
+        );
+    }
+
+    // Xwayland commits the resized window, releasing the pending titlebar state; hover
+    // changes are independent again.
+    surface.obj.send_request(Req::<WlSurface>::Commit).unwrap();
+    f.run();
+    f.testwl.pointer_motion(100.0, 10.0);
+    f.run();
+    let data = f.testwl.get_surface_data(subsurface_id).unwrap();
+    let Some(SurfaceRole::Subsurface(sub)) = &data.role else {
+        panic!("not a subsurface: {:?}", data.role);
+    };
+    assert_eq!(sub.last_commit_sync, Some(false));
+    assert_eq!(sub.desync_requests, 2);
+    assert!(sub.sync);
+}
+
+#[test]
+fn decoration_not_redrawn_when_unchanged() {
+    // Entering an output at the same scale recomputes the viewport, which must not redraw and
+    // recommit an unchanged titlebar: that commit would wait for a parent commit that an idle
+    // client never makes, blocking hover updates behind it.
+    let (mut f, compositor) = TestFixture::new_with_compositor();
+    let _pointer = TestObject::<WlPointer>::from_request(
+        &compositor.seat.obj,
+        wl_seat::Request::GetPointer {},
+    );
+    let (_, output) = f.new_output(0, 0);
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&compositor, window);
+    f.testwl
+        .force_decoration_mode(id, zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+    let subsurface_id = f.testwl.last_created_surface_id().unwrap();
+
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+    f.run();
+
+    f.testwl.move_pointer_to(subsurface_id, 50.0, 10.0);
+    f.run();
+    f.testwl.pointer_motion(90.0, 10.0);
+    f.run();
+    {
+        let data = f.testwl.get_surface_data(subsurface_id).unwrap();
+        let Some(SurfaceRole::Subsurface(sub)) = &data.role else {
+            panic!("not a subsurface: {:?}", data.role);
+        };
+        assert_eq!(
+            sub.last_commit_sync,
+            Some(false),
+            "hover redraw is independent"
+        );
+        assert!(sub.sync);
+    }
+
+    // The same holds after a title change: the redraw cache must know the new title, or the
+    // next viewport update would redraw synchronized for it.
+    f.satellite
+        .set_win_title(window, WmName::WmName("window".into()));
+    f.run();
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+    f.run();
+    f.testwl.pointer_motion(50.0, 10.0);
+    f.run();
+    f.testwl.pointer_motion(90.0, 10.0);
+    f.run();
+    let data = f.testwl.get_surface_data(subsurface_id).unwrap();
+    let Some(SurfaceRole::Subsurface(sub)) = &data.role else {
+        panic!("not a subsurface: {:?}", data.role);
+    };
+    assert_eq!(
+        sub.last_commit_sync,
+        Some(false),
+        "hover redraw is still independent"
+    );
+    assert!(sub.sync);
+}
+
+#[test]
+fn decoration_hidden_by_fullscreen_stays_hidden_on_pointer_leave() {
+    // Going fullscreen while the close button is hovered removes the titlebar; the pointer
+    // leaving afterwards must not redraw the button and map the titlebar again.
+    let (mut f, compositor) = TestFixture::new_with_compositor();
+    let _pointer = TestObject::<WlPointer>::from_request(
+        &compositor.seat.obj,
+        wl_seat::Request::GetPointer {},
+    );
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&compositor, window);
+    f.testwl
+        .force_decoration_mode(id, zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+    let subsurface_id = f.testwl.last_created_surface_id().unwrap();
+
+    f.testwl.move_pointer_to(subsurface_id, 90.0, 10.0);
+    f.run();
+    f.testwl.pointer_motion(90.0, 10.0);
+    f.run();
+    assert!(
+        f.testwl
+            .get_surface_data(subsurface_id)
+            .unwrap()
+            .buffer
+            .is_some()
+    );
+
+    f.testwl
+        .configure_toplevel(id, 100, 100, vec![xdg_toplevel::State::Fullscreen]);
+    f.run();
+    assert!(
+        f.testwl
+            .get_surface_data(subsurface_id)
+            .unwrap()
+            .buffer
+            .is_none()
+    );
+
+    f.testwl.pointer_leave(subsurface_id);
+    f.run();
+    assert!(
+        f.testwl
+            .get_surface_data(subsurface_id)
+            .unwrap()
+            .buffer
+            .is_none(),
+        "titlebar was mapped again by the pointer leaving"
+    );
+
+    // Leaving fullscreen at the same size and title draws the titlebar again (the redraw
+    // cache must not treat it as already drawn), and hover is independent again.
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+    assert!(
+        f.testwl
+            .get_surface_data(subsurface_id)
+            .unwrap()
+            .buffer
+            .is_some()
+    );
+    f.testwl.move_pointer_to(subsurface_id, 50.0, 10.0);
+    f.run();
+    f.testwl.pointer_motion(90.0, 10.0);
+    f.run();
+    let data = f.testwl.get_surface_data(subsurface_id).unwrap();
+    let Some(SurfaceRole::Subsurface(sub)) = &data.role else {
+        panic!("not a subsurface: {:?}", data.role);
+    };
+    assert_eq!(sub.last_commit_sync, Some(false));
+    assert!(sub.sync);
+}
+
+#[test]
+fn decoration_title_damage_covers_new_title() {
+    // Setting a title where there was none must damage the newly drawn text, not only the
+    // (empty) area of the previous title, and apply without a parent commit.
+    let (mut f, compositor) = TestFixture::new_with_compositor();
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&compositor, window);
+    f.testwl
+        .force_decoration_mode(id, zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+    let subsurface_id = f.testwl.last_created_surface_id().unwrap();
+    let damage_requests = f
+        .testwl
+        .get_surface_data(subsurface_id)
+        .unwrap()
+        .damage_requests;
+
+    f.satellite
+        .set_win_title(window, WmName::WmName("window".into()));
+    f.run();
+    let data = f.testwl.get_surface_data(subsurface_id).unwrap();
+    assert_eq!(
+        data.damage_requests,
+        damage_requests + 1,
+        "title was not damaged"
+    );
+    let damage = data.last_damage.as_ref().unwrap();
+    assert!(damage.width > 0, "{damage:?}");
+    assert_eq!(
+        damage.height,
+        super::decoration::DecorationsDataSatellite::TITLEBAR_HEIGHT,
+        "{damage:?}"
+    );
+    let Some(SurfaceRole::Subsurface(sub)) = &data.role else {
+        panic!("not a subsurface: {:?}", data.role);
+    };
+    assert_eq!(sub.last_commit_sync, Some(false));
+    assert_eq!(sub.desync_requests, 1);
+    assert!(sub.sync);
+
+    // While a resize waits for the window's new contents, a title change joins it.
+    f.reconfigure_window(
+        window,
+        WindowDims {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 100,
+        },
+        false,
+    );
+    f.run();
+    f.run();
+    f.satellite
+        .set_win_title(window, WmName::WmName("another".into()));
+    f.run();
+    let data = f.testwl.get_surface_data(subsurface_id).unwrap();
+    let Some(SurfaceRole::Subsurface(sub)) = &data.role else {
+        panic!("not a subsurface: {:?}", data.role);
+    };
+    assert_eq!(sub.last_commit_sync, Some(true));
+    assert_eq!(sub.desync_requests, 1);
+}
+
+#[test]
 fn client_side_decorations_no_global() {
     let mut f = TestFixture::new_pre_connect(|testwl| {
         testwl.disable_decorations_global();
