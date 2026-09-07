@@ -316,10 +316,10 @@ impl PopupRequest {
             (self.x_offset.1 as f64 / parent_scale) as i32,
         );
         self.x_size = (popup_dims.width, popup_dims.height);
-        self.size = (
-            1.max((popup_dims.width as f64 / popup_scale) as i32),
-            1.max((popup_dims.height as f64 / popup_scale) as i32),
-        );
+        // Rounded up like the viewport, so that the positioner describes the size the popup
+        // is committed at.
+        let (width, height) = event::logical_size(popup_dims.width, popup_dims.height, popup_scale);
+        self.size = (width.max(1), height.max(1));
     }
 }
 

@@ -822,8 +822,8 @@ impl TestFixture<FakeXConnection> {
                 assert_eq!(
                     pos.size.as_ref().unwrap(),
                     &testwl::Vec2 {
-                        x: (dims.width as f64 / scale) as i32,
-                        y: (dims.height as f64 / scale) as i32
+                        x: (dims.width as f64 / scale).ceil() as i32,
+                        y: (dims.height as f64 / scale).ceil() as i32
                     }
                 );
 
@@ -2595,7 +2595,10 @@ fn fractional_scale_small_popup() {
         .get_surface_data(popup_id)
         .expect("Missing popup data");
     let pos = &data.popup().positioner_state;
-    assert_eq!(pos.size.unwrap(), testwl::Vec2 { x: 1, y: 1 });
+    // Rounded up like the viewport.
+    assert_eq!(pos.size.unwrap(), testwl::Vec2 { x: 2, y: 1 });
+    let viewport = data.viewport.as_ref().expect("Missing viewport");
+    assert_eq!((viewport.width, viewport.height), (2, 1));
 }
 
 #[test]
@@ -3739,6 +3742,14 @@ fn popup_keeps_its_x_geometry_across_reanchors_at_fractional_scale() {
         f.run();
         f.run();
         assert_eq!(f.connection().window(popup).dims, expected);
+        // 50 / 1.3 rounded up, in the positioner and the viewport alike.
+        let data = f.testwl.get_surface_data(p_id).unwrap();
+        assert_eq!(
+            data.popup().positioner_state.size,
+            Some(testwl::Vec2 { x: 39, y: 39 })
+        );
+        let viewport = data.viewport.as_ref().expect("Missing viewport");
+        assert_eq!((viewport.width, viewport.height), (39, 39));
     }
 }
 
@@ -3771,22 +3782,20 @@ fn popup_keeps_odd_x_size_across_scale_change() {
     };
     assert_eq!(f.connection().window(popup).dims, expected);
 
-    // 51 X pixels are 25.5 logical pixels at scale 2; the popup is requested at 25 and must
-    // stay 51 wide when that is granted.
+    // 51 X pixels are 25.5 logical pixels at scale 2; the popup is requested at 26, the size
+    // its viewport has, and must stay 51 wide when that is granted.
     output.scale(2);
     output.done();
     f.run();
     f.run();
     assert_eq!(f.connection().window(popup).dims, expected);
+    let data = f.testwl.get_surface_data(p_id).unwrap();
     assert_eq!(
-        f.testwl
-            .get_surface_data(p_id)
-            .unwrap()
-            .popup()
-            .positioner_state
-            .size,
-        Some(testwl::Vec2 { x: 25, y: 25 })
+        data.popup().positioner_state.size,
+        Some(testwl::Vec2 { x: 26, y: 26 })
     );
+    let viewport = data.viewport.as_ref().expect("Missing viewport");
+    assert_eq!((viewport.width, viewport.height), (26, 26));
 
     output.scale(1);
     output.done();
