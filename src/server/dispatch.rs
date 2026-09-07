@@ -113,6 +113,9 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
 
                 if configured {
                     client.attach(buffer.as_deref(), x, y);
+                    if let Some(xdg) = role.as_mut().and_then(|role| role.xdg_mut()) {
+                        xdg.pending_buffer = Some(buffer.is_some());
+                    }
                 } else {
                     let buffer = buffer.as_deref().cloned();
                     cmd.insert(*entity, (SurfaceAttach { buffer, x, y },));
@@ -139,6 +142,14 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
             Request::<WlSurface>::Commit => {
                 if configured {
                     client.commit();
+                    if let Some(role) = role.as_mut() {
+                        if role.xdg_mut().is_some_and(|xdg| xdg.committed())
+                            && matches!(**role, SurfaceRole::Popup(_))
+                        {
+                            // Mapped now; see the xdg_surface configure handler.
+                            state.pending_popup_refresh.push(*entity);
+                        }
+                    }
                 }
             }
             Request::<WlSurface>::Destroy => {
