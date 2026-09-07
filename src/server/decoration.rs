@@ -43,6 +43,9 @@ pub struct DecorationsDataSatellite {
     title: Option<String>,
     title_rect: Rect,
     should_draw: bool,
+    /// Whether the titlebar was last committed in synchronized mode and the parent has not
+    /// committed since, i.e. the compositor is still holding that titlebar state back.
+    awaiting_parent_commit: bool,
     remove_buffer: bool,
 }
 
@@ -104,6 +107,7 @@ impl DecorationsDataSatellite {
                 title_rect: Rect::from_ltrb(0.0, 0.0, 0.0, 0.0).unwrap(),
                 should_draw: true,
                 remove_buffer: false,
+                awaiting_parent_commit: false,
             }
             .into(),
             new_pool.map(|p| {
@@ -118,7 +122,35 @@ impl DecorationsDataSatellite {
         world.get::<&mut SlotPool>(self.pool).unwrap()
     }
 
+    /// Commits the titlebar together with the parent's next commit. Used for changes that must
+    /// stay in step with the X window, such as a resize (#268).
     fn update_buffer(&mut self, world: &World) {
+        self.update_buffer_inner(world);
+        self.awaiting_parent_commit = true;
+    }
+
+    /// Commits the titlebar on its own, for changes the parent will not repaint for, such as
+    /// the close button's hover state. A sub-surface is synchronized by default, so its commits
+    /// are only applied with the parent's; an X client that has nothing to repaint would leave
+    /// the change unapplied indefinitely. Switch to desynchronized mode for the commit, unless
+    /// a synchronized commit is still waiting on the parent, in which case that commit must
+    /// not be applied early and this change simply joins it.
+    fn update_buffer_independently(&mut self, world: &World) {
+        if self.awaiting_parent_commit {
+            self.update_buffer_inner(world);
+            return;
+        }
+        self.subsurface.set_desync();
+        self.update_buffer_inner(world);
+        self.subsurface.set_sync();
+    }
+
+    /// The parent surface committed, applying whatever titlebar state was cached with it.
+    pub fn parent_committed(&mut self) {
+        self.awaiting_parent_commit = false;
+    }
+
+    fn update_buffer_inner(&mut self, world: &World) {
         let mut pool = self.pool(world);
         let (buffer, data) = match pool.create_buffer(
             self.pixmap.width() as i32,
@@ -148,6 +180,7 @@ impl DecorationsDataSatellite {
             if self.remove_buffer {
                 self.surface.attach(None, 0, 0);
                 self.surface.commit();
+                self.awaiting_parent_commit = true;
                 self.remove_buffer = false;
             }
             return;
@@ -230,7 +263,7 @@ impl DecorationsDataSatellite {
             x.width() as i32,
             x.height() as i32,
         );
-        self.update_buffer(world);
+        self.update_buffer_independently(world);
     }
 
     pub fn set_title(&mut self, world: &World, title: &str) {
@@ -277,7 +310,7 @@ impl DecorationsDataSatellite {
 
         self.surface
             .damage_buffer(0, 0, damaged_width as i32, last_title_rect.height() as i32);
-        self.update_buffer(world);
+        self.update_buffer_independently(world);
     }
 
     pub fn handle_fullscreen(&mut self, fullscreen: bool) {

@@ -180,6 +180,12 @@ pub struct Subsurface {
     pub subsurface: WlSubsurface,
     pub position: Vec2,
     pub parent: SurfaceId,
+    /// Synchronized mode, the default.
+    pub sync: bool,
+    /// Whether the last wl_surface.commit happened in synchronized mode.
+    pub last_commit_sync: Option<bool>,
+    /// Number of set_desync requests seen.
+    pub desync_requests: u32,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
@@ -962,6 +968,23 @@ impl Server {
     }
 
     #[track_caller]
+    /// Makes the pointer leave the given surface.
+    pub fn pointer_leave(&mut self, surface: SurfaceId) {
+        let pointer = self.state.pointer.as_ref().expect("No pointer created");
+        let data = self.state.surfaces.get(&surface).expect("No such surface");
+        pointer.pointer.leave(25, &data.surface);
+        pointer.pointer.frame();
+        self.display.flush_clients().unwrap();
+    }
+
+    /// Moves the pointer within the surface it last entered.
+    pub fn pointer_motion(&mut self, x: f64, y: f64) {
+        let pointer = self.state.pointer.as_ref().expect("No pointer created");
+        pointer.pointer.motion(0, x, y);
+        pointer.pointer.frame();
+        self.display.flush_clients().unwrap();
+    }
+
     pub fn move_pointer_to(&mut self, surface: SurfaceId, x: f64, y: f64) {
         let pointer = self.state.pointer.as_ref().expect("No pointer created");
         let data = self.state.surfaces.get(&surface).expect("No such surface");
@@ -2128,6 +2151,9 @@ impl Dispatch<WlSubcompositor, ()> for State {
                     parent: SurfaceId::from(&parent),
                     subsurface: data_init.init(id, surface_id),
                     position: Vec2::default(),
+                    sync: true,
+                    last_commit_sync: None,
+                    desync_requests: 0,
                 }));
             }
             Destroy => {}
@@ -2175,7 +2201,11 @@ impl Dispatch<WlSurface, ()> for State {
                     height,
                 });
             }
-            Commit => {}
+            Commit => {
+                if let Some(SurfaceRole::Subsurface(subsurface)) = &mut data.role {
+                    subsurface.last_commit_sync = Some(subsurface.sync);
+                }
+            }
             Destroy => {
                 let id = SurfaceId(resource.id().protocol_id());
                 if let Some(kb) = state
@@ -2215,7 +2245,17 @@ impl Dispatch<WlSubsurface, SurfaceId> for State {
 
                 subsurface.position = Vec2 { x, y };
             }
-            SetDesync | Destroy => {}
+            SetSync | SetDesync => {
+                let data = state.surfaces.get_mut(surface_id).unwrap();
+                let Some(SurfaceRole::Subsurface(subsurface)) = &mut data.role else {
+                    unreachable!();
+                };
+                subsurface.sync = matches!(request, SetSync);
+                if !subsurface.sync {
+                    subsurface.desync_requests += 1;
+                }
+            }
+            Destroy => {}
             other => todo!("unhandled wl_subsurface request: {other:?}"),
         }
     }

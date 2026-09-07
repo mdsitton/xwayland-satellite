@@ -4509,6 +4509,102 @@ fn popup_newer_x_resize_survives_the_older_reply_being_applied() {
 }
 
 #[test]
+fn decoration_hover_redraw_applies_independently() {
+    // The titlebar is a synchronized sub-surface, so its commits only take effect with the
+    // parent's. Hovering the close button must not wait for the X client to repaint: that
+    // redraw is committed desynchronized, and the mode is restored afterwards so resizes stay
+    // in step with the window.
+    let (mut f, compositor) = TestFixture::new_with_compositor();
+    let _pointer = TestObject::<WlPointer>::from_request(
+        &compositor.seat.obj,
+        wl_seat::Request::GetPointer {},
+    );
+    let window = Window::new(1);
+    let (surface, id) = f.create_toplevel(&compositor, window);
+    f.testwl
+        .force_decoration_mode(id, zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+    let subsurface_id = f.testwl.last_created_surface_id().unwrap();
+    assert_ne!(subsurface_id, id);
+    {
+        let data = f.testwl.get_surface_data(subsurface_id).unwrap();
+        let Some(SurfaceRole::Subsurface(sub)) = &data.role else {
+            panic!("not a subsurface: {:?}", data.role);
+        };
+        assert!(sub.sync);
+        assert_eq!(
+            sub.last_commit_sync,
+            Some(true),
+            "resize commit is synchronized"
+        );
+    }
+
+    // Enter the titlebar away from the close button, then move onto it.
+    f.testwl.move_pointer_to(subsurface_id, 50.0, 10.0);
+    f.run();
+    f.testwl.pointer_motion(90.0, 10.0);
+    f.run();
+    let data = f.testwl.get_surface_data(subsurface_id).unwrap();
+    let Some(SurfaceRole::Subsurface(sub)) = &data.role else {
+        panic!("not a subsurface: {:?}", data.role);
+    };
+    assert_eq!(
+        sub.last_commit_sync,
+        Some(false),
+        "hover redraw is committed desynchronized"
+    );
+    assert!(sub.sync, "synchronized mode is restored");
+    assert!(data.last_damage.is_some(), "close button was redrawn");
+    assert_eq!(sub.desync_requests, 1);
+
+    // A resize from the X side redraws the titlebar synchronized, waiting for the window's
+    // new contents. Until then hover changes must not desynchronize, or the new titlebar
+    // size would show before the window.
+    f.reconfigure_window(
+        window,
+        WindowDims {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 100,
+        },
+        false,
+    );
+    f.run();
+    f.run();
+    f.testwl.pointer_motion(100.0, 10.0); // off the button (it moved with the width)
+    f.run();
+    f.testwl.pointer_motion(190.0, 10.0); // back on it
+    f.run();
+    {
+        let data = f.testwl.get_surface_data(subsurface_id).unwrap();
+        let Some(SurfaceRole::Subsurface(sub)) = &data.role else {
+            panic!("not a subsurface: {:?}", data.role);
+        };
+        assert_eq!(sub.last_commit_sync, Some(true), "joins the pending resize");
+        assert_eq!(
+            sub.desync_requests, 1,
+            "no desync while a resize is pending"
+        );
+    }
+
+    // Xwayland commits the resized window, releasing the pending titlebar state; hover
+    // changes are independent again.
+    surface.obj.send_request(Req::<WlSurface>::Commit).unwrap();
+    f.run();
+    f.testwl.pointer_motion(100.0, 10.0);
+    f.run();
+    let data = f.testwl.get_surface_data(subsurface_id).unwrap();
+    let Some(SurfaceRole::Subsurface(sub)) = &data.role else {
+        panic!("not a subsurface: {:?}", data.role);
+    };
+    assert_eq!(sub.last_commit_sync, Some(false));
+    assert_eq!(sub.desync_requests, 2);
+    assert!(sub.sync);
+}
+
+#[test]
 fn client_side_decorations_no_global() {
     let mut f = TestFixture::new_pre_connect(|testwl| {
         testwl.disable_decorations_global();

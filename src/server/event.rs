@@ -473,6 +473,13 @@ impl SurfaceEvents {
             state.pending_popup_refresh.push(target);
         }
         cmd.run_on(&mut state.world);
+        if let Ok(mut role) = state.world.get::<&mut SurfaceRole>(target) {
+            if let SurfaceRole::Toplevel(Some(toplevel)) = &mut *role {
+                if let Some(d) = toplevel.decoration.satellite.as_mut() {
+                    d.parent_committed();
+                }
+            }
+        }
     }
 
     fn toplevel_event<C: XConnection>(
