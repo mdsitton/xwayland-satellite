@@ -4644,6 +4644,58 @@ fn decoration_not_redrawn_when_unchanged() {
 }
 
 #[test]
+fn decoration_hidden_by_fullscreen_stays_hidden_on_pointer_leave() {
+    // Going fullscreen while the close button is hovered removes the titlebar; the pointer
+    // leaving afterwards must not redraw the button and map the titlebar again.
+    let (mut f, compositor) = TestFixture::new_with_compositor();
+    let _pointer = TestObject::<WlPointer>::from_request(
+        &compositor.seat.obj,
+        wl_seat::Request::GetPointer {},
+    );
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&compositor, window);
+    f.testwl
+        .force_decoration_mode(id, zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+    let subsurface_id = f.testwl.last_created_surface_id().unwrap();
+
+    f.testwl.move_pointer_to(subsurface_id, 90.0, 10.0);
+    f.run();
+    f.testwl.pointer_motion(90.0, 10.0);
+    f.run();
+    assert!(
+        f.testwl
+            .get_surface_data(subsurface_id)
+            .unwrap()
+            .buffer
+            .is_some()
+    );
+
+    f.testwl
+        .configure_toplevel(id, 100, 100, vec![xdg_toplevel::State::Fullscreen]);
+    f.run();
+    assert!(
+        f.testwl
+            .get_surface_data(subsurface_id)
+            .unwrap()
+            .buffer
+            .is_none()
+    );
+
+    f.testwl.pointer_leave(subsurface_id);
+    f.run();
+    assert!(
+        f.testwl
+            .get_surface_data(subsurface_id)
+            .unwrap()
+            .buffer
+            .is_none(),
+        "titlebar was mapped again by the pointer leaving"
+    );
+}
+
+#[test]
 fn client_side_decorations_no_global() {
     let mut f = TestFixture::new_pre_connect(|testwl| {
         testwl.disable_decorations_global();

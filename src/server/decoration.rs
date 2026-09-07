@@ -261,6 +261,9 @@ impl DecorationsDataSatellite {
     }
 
     fn redraw_x_pixmap(&mut self, world: &World) {
+        if !self.should_draw {
+            return;
+        }
         let x = x_pixmap(self.pixmap.height(), self.scale, self.x_data.hovered);
 
         self.pixmap.draw_pixmap(
@@ -335,6 +338,9 @@ impl DecorationsDataSatellite {
         if self.should_draw == fullscreen {
             self.should_draw = !fullscreen;
             self.remove_buffer = fullscreen;
+            if fullscreen {
+                self.x_data.hovered = false;
+            }
         }
     }
 
