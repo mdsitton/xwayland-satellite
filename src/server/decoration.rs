@@ -325,12 +325,12 @@ impl DecorationsDataSatellite {
             );
         }
 
-        let damaged_width = last_title_rect
-            .width()
-            .max(title_pixmap.map(|p| p.width() as f32).unwrap_or(0.0));
+        // Both titles start at the origin, so their union is the larger of each extent.
+        let damaged_width = last_title_rect.width().max(new_title_rect.width());
+        let damaged_height = last_title_rect.height().max(new_title_rect.height());
 
         self.surface
-            .damage_buffer(0, 0, damaged_width as i32, last_title_rect.height() as i32);
+            .damage_buffer(0, 0, damaged_width as i32, damaged_height as i32);
         self.update_buffer_independently(world);
     }
 
