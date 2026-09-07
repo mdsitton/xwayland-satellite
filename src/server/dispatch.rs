@@ -150,6 +150,11 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
                             state.pending_popup_refresh.push(*entity);
                         }
                     }
+                    if let Some(SurfaceRole::Toplevel(Some(toplevel))) = role.as_deref_mut() {
+                        if let Some(d) = toplevel.decoration.satellite.as_mut() {
+                            d.parent_committed();
+                        }
+                    }
                 }
             }
             Request::<WlSurface>::Destroy => {
