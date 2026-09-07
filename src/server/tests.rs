@@ -4696,6 +4696,32 @@ fn decoration_hidden_by_fullscreen_stays_hidden_on_pointer_leave() {
 }
 
 #[test]
+fn decoration_title_damage_covers_new_title() {
+    // Setting a title where there was none must damage the newly drawn text, not only the
+    // (empty) area of the previous title.
+    let (mut f, compositor) = TestFixture::new_with_compositor();
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&compositor, window);
+    f.testwl
+        .force_decoration_mode(id, zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+    let subsurface_id = f.testwl.last_created_surface_id().unwrap();
+
+    f.satellite
+        .set_win_title(window, WmName::WmName("window".into()));
+    f.run();
+    let data = f.testwl.get_surface_data(subsurface_id).unwrap();
+    let damage = data.last_damage.as_ref().expect("title was not drawn");
+    assert!(damage.width > 0, "{damage:?}");
+    assert_eq!(
+        damage.height,
+        super::decoration::DecorationsDataSatellite::TITLEBAR_HEIGHT,
+        "{damage:?}"
+    );
+}
+
+#[test]
 fn client_side_decorations_no_global() {
     let mut f = TestFixture::new_pre_connect(|testwl| {
         testwl.disable_decorations_global();
