@@ -3232,10 +3232,58 @@ fn popup_under_satellite_decorations() {
         },
     );
 
-    // Without decorations (fullscreen parent) the anchor is the whole parent.
+    // Resizing the parent re-anchors open popups to the new content size, telling the
+    // compositor which configure is being responded to and the parent's future geometry
+    // (content plus titlebar).
+    f.testwl.configure_toplevel(id, 80, 80, vec![]);
+    f.run();
+    f.run();
+    let parent_serial = f
+        .testwl
+        .get_surface_data(id)
+        .unwrap()
+        .xdg()
+        .last_configure_serial;
+    let data = f.testwl.get_surface_data(p_id).unwrap();
+    let pos = &data.popup().positioner_state;
+    assert_eq!(
+        pos.anchor_rect,
+        Some(testwl::Rect {
+            size: testwl::Vec2 { x: 80, y: 55 },
+            offset: testwl::Vec2 {
+                x: 0,
+                y: super::decoration::DecorationsDataSatellite::TITLEBAR_HEIGHT
+            }
+        })
+    );
+    assert_eq!(pos.parent_size, Some(testwl::Vec2 { x: 80, y: 80 }));
+    assert_eq!(pos.parent_configure, Some(parent_serial));
+
+    // Without decorations (fullscreen parent) the anchor is the whole parent, and popups that
+    // are still open are re-anchored.
     f.testwl
         .configure_toplevel(id, 100, 100, vec![xdg_toplevel::State::Fullscreen]);
     f.run();
+    f.run();
+    let data = f.testwl.get_surface_data(p_id).unwrap();
+    assert_eq!(
+        data.popup().positioner_state.anchor_rect,
+        Some(testwl::Rect {
+            size: testwl::Vec2 { x: 100, y: 100 },
+            offset: testwl::Vec2 { x: 0, y: 0 }
+        })
+    );
+    f.assert_window_dimensions(
+        popup,
+        p_id,
+        WindowDims {
+            x: 10,
+            y: 20,
+            width: 50,
+            height: 50,
+        },
+    );
+
     let popup2 = Window::new(3);
     let (_, p2_id) = f.create_popup(
         &compositor,
@@ -3251,6 +3299,24 @@ fn popup_under_satellite_decorations() {
             .offset,
         testwl::Vec2 { x: 0, y: 0 }
     );
+
+    // Leaving fullscreen brings the titlebar, and the anchor below it, back.
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+    f.run();
+    for id in [p_id, p2_id] {
+        let data = f.testwl.get_surface_data(id).unwrap();
+        assert_eq!(
+            data.popup().positioner_state.anchor_rect,
+            Some(testwl::Rect {
+                size: testwl::Vec2 { x: 100, y: 75 },
+                offset: testwl::Vec2 {
+                    x: 0,
+                    y: super::decoration::DecorationsDataSatellite::TITLEBAR_HEIGHT
+                }
+            })
+        );
+    }
 }
 
 #[test]
@@ -3299,6 +3365,71 @@ fn popup_under_satellite_decorations_fractional_scale() {
             }
         })
     );
+}
+
+#[test]
+fn popup_reanchored_on_undecorated_parent_resize() {
+    // The anchor size goes stale on a resize whether or not the parent has a titlebar, when
+    // shrinking as well as when growing.
+    let (mut f, compositor) = TestFixture::new_with_compositor();
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&compositor, window);
+    f.testwl
+        .force_decoration_mode(id, zxdg_toplevel_decoration_v1::Mode::ServerSide);
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+
+    let popup = Window::new(2);
+    let (_, p_id) = f.create_popup(
+        &compositor,
+        PopupBuilder::new(popup, window, id).x(10).y(20),
+    );
+    let data = f.testwl.get_surface_data(p_id).unwrap();
+    assert_eq!(
+        data.popup().positioner_state.anchor_rect,
+        Some(testwl::Rect {
+            size: testwl::Vec2 { x: 100, y: 100 },
+            offset: testwl::Vec2 { x: 0, y: 0 }
+        })
+    );
+
+    for (width, height) in [(80, 60), (120, 100)] {
+        f.testwl.configure_toplevel(id, width, height, vec![]);
+        f.run();
+        f.run();
+        let parent_serial = f
+            .testwl
+            .get_surface_data(id)
+            .unwrap()
+            .xdg()
+            .last_configure_serial;
+        let data = f.testwl.get_surface_data(p_id).unwrap();
+        let pos = &data.popup().positioner_state;
+        assert_eq!(
+            pos.anchor_rect,
+            Some(testwl::Rect {
+                size: testwl::Vec2 {
+                    x: width,
+                    y: height
+                },
+                offset: testwl::Vec2 { x: 0, y: 0 }
+            }),
+            "{width}x{height}"
+        );
+        assert_eq!(
+            pos.parent_size,
+            Some(testwl::Vec2 {
+                x: width,
+                y: height
+            }),
+            "{width}x{height}"
+        );
+        assert_eq!(
+            pos.parent_configure,
+            Some(parent_serial),
+            "{width}x{height}"
+        );
+    }
 }
 
 #[test]

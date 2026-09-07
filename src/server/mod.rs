@@ -247,10 +247,38 @@ struct PopupData {
     popup: XdgPopup,
     positioner: XdgPositioner,
     xdg: XdgSurfaceData,
+    parent: Entity,
     /// Origin of the positioner's anchor rect within the parent's window geometry, i.e. where
     /// the parent's X window content starts. This is non-zero when satellite draws the parent's
     /// titlebar, which is part of the parent's window geometry but not of its X window.
     anchor_origin: (i32, i32),
+    /// Size of the positioner's anchor rect, i.e. the parent's X window content size.
+    anchor_size: (i32, i32),
+}
+
+/// Returns the origin and size of the area popups of the given parent are anchored to, in the
+/// parent's surface coordinates. Popups are positioned relative to the parent's window geometry,
+/// which includes the titlebar satellite draws above the X window, so the anchor is the X
+/// window's area below it.
+fn popup_anchor(
+    parent_role: &SurfaceRole,
+    parent_dims: WindowDims,
+    scale: f64,
+) -> ((i32, i32), (i32, i32)) {
+    let (width, height) = event::logical_size(parent_dims.width, parent_dims.height, scale);
+    let origin = match parent_role {
+        SurfaceRole::Toplevel(Some(toplevel))
+            if toplevel
+                .decoration
+                .satellite
+                .as_ref()
+                .is_some_and(|d| d.will_draw_decorations(width)) =>
+        {
+            (0, DecorationsDataSatellite::TITLEBAR_HEIGHT)
+        }
+        _ => (0, 0),
+    };
+    (origin, (width, height))
 }
 
 trait Event {
@@ -1575,6 +1603,71 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         }
     }
 
+    /// Re-anchors the popups of the given parent after it was configured, for when its
+    /// decorations or size changed (e.g. going fullscreen removes the titlebar). Popups whose
+    /// anchor is unchanged are left alone. `serial` is the parent's xdg_surface.configure
+    /// serial being responded to, which the compositor may use, together with the parent's
+    /// future window geometry, to constrain the repositioned popup (xdg_popup.reposition).
+    pub(super) fn refresh_child_popups(&mut self, parent: Entity, serial: u32) {
+        if self.xdg_wm_base.version() < 3 {
+            return;
+        }
+        let Ok(mut parent_query) = self
+            .world
+            .query_one::<(&WindowData, &SurfaceScaleFactor, &SurfaceRole)>(parent)
+        else {
+            return;
+        };
+        let Some((parent_window, parent_scale, parent_role)) = parent_query.get() else {
+            return;
+        };
+        let parent_dims = parent_window.attrs.dims;
+        let scale = parent_scale.0;
+        let (anchor_origin, (width, height)) = popup_anchor(parent_role, parent_dims, scale);
+        drop(parent_query);
+
+        let children: Vec<Entity> = self
+            .world
+            .query::<&SurfaceRole>()
+            .iter()
+            .filter_map(|(entity, role)| match role {
+                SurfaceRole::Popup(Some(popup)) if popup.parent == parent => Some(entity),
+                _ => None,
+            })
+            .collect();
+
+        for entity in children {
+            let Ok((role, window)) = self
+                .world
+                .query_one_mut::<(&mut SurfaceRole, &WindowData)>(entity)
+            else {
+                continue;
+            };
+            let SurfaceRole::Popup(Some(popup)) = role else {
+                continue;
+            };
+            if popup.anchor_origin == anchor_origin && popup.anchor_size == (width, height) {
+                continue;
+            }
+            debug!("re-anchoring popup {entity:?} to {anchor_origin:?} {width}x{height}");
+            popup.anchor_origin = anchor_origin;
+            popup.anchor_size = (width, height);
+            popup
+                .positioner
+                .set_anchor_rect(anchor_origin.0, anchor_origin.1, width, height);
+            // The parent's window geometry is its content plus the titlebar above it.
+            popup
+                .positioner
+                .set_parent_size(width, height + anchor_origin.1);
+            popup.positioner.set_parent_configure(serial);
+            popup.positioner.set_offset(
+                ((window.attrs.dims.x - parent_dims.x) as f64 / scale) as i32,
+                ((window.attrs.dims.y - parent_dims.y) as f64 / scale) as i32,
+            );
+            popup.popup.reposition(&popup.positioner, 0);
+        }
+    }
+
     fn create_popup(&mut self, entity: Entity, xdg: XdgSurface, parent: x::Window) -> PopupData {
         let mut query = self
             .world
@@ -1599,22 +1692,8 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             xdg.id()
         );
 
-        let (parent_width, parent_height) =
-            event::logical_size(parent_dims.width, parent_dims.height, initial_scale);
-        // Popups are positioned relative to the parent's window geometry, which includes the
-        // titlebar satellite draws above the X window. Anchor to the X window's area instead.
-        let anchor_origin = match parent_role {
-            SurfaceRole::Toplevel(Some(toplevel))
-                if toplevel
-                    .decoration
-                    .satellite
-                    .as_ref()
-                    .is_some_and(|d| d.will_draw_decorations(parent_width)) =>
-            {
-                (0, DecorationsDataSatellite::TITLEBAR_HEIGHT)
-            }
-            _ => (0, 0),
-        };
+        let (anchor_origin, (parent_width, parent_height)) =
+            popup_anchor(parent_role, parent_dims, initial_scale);
 
         let positioner = self.xdg_wm_base.create_positioner(&self.qh, ());
         positioner.set_size(
@@ -1644,7 +1723,9 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         PopupData {
             popup,
             positioner,
+            parent: self.windows[&parent],
             anchor_origin,
+            anchor_size: (parent_width, parent_height),
             xdg: XdgSurfaceData {
                 surface: xdg,
                 configured: false,
