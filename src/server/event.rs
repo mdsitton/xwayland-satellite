@@ -356,9 +356,13 @@ impl SurfaceEvents {
                 width: width as _,
                 height: height as _,
             };
+            let is_toplevel = matches!(role, SurfaceRole::Toplevel(Some(_)));
             drop(query);
             state.world.insert_one(target, pending).unwrap();
             update_surface_viewport(&state.world, state.world.query_one(target).unwrap());
+            if is_toplevel {
+                state.refresh_child_popups(target, serial);
+            }
         }
 
         let (surface, attach, callback) = state

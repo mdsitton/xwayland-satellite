@@ -1754,6 +1754,8 @@ pub struct PositionerState {
     pub offset: Vec2,
     pub anchor: xdg_positioner::Anchor,
     pub gravity: xdg_positioner::Gravity,
+    pub parent_size: Option<Vec2>,
+    pub parent_configure: Option<u32>,
 }
 
 impl Default for PositionerState {
@@ -1764,6 +1766,8 @@ impl Default for PositionerState {
             offset: Vec2 { x: 0, y: 0 },
             anchor: xdg_positioner::Anchor::None,
             gravity: xdg_positioner::Gravity::None,
+            parent_size: None,
+            parent_configure: None,
         }
     }
 }
@@ -1834,6 +1838,18 @@ impl Dispatch<XdgPositioner, ()> for State {
                 data.remove();
             }
             xdg_positioner::Request::SetConstraintAdjustment { .. } => {}
+            xdg_positioner::Request::SetParentSize {
+                parent_width,
+                parent_height,
+            } => {
+                data.get_mut().parent_size = Some(Vec2 {
+                    x: parent_width,
+                    y: parent_height,
+                });
+            }
+            xdg_positioner::Request::SetParentConfigure { serial } => {
+                data.get_mut().parent_configure = Some(serial);
+            }
             other => todo!("unhandled positioner request {other:?}"),
         }
     }
