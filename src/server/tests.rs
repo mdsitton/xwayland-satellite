@@ -3524,6 +3524,76 @@ fn popup_configures_use_the_anchor_they_were_requested_with() {
 }
 
 #[test]
+fn popup_reanchored_on_x_resize_and_scale_change() {
+    // Parent geometry changes that do not come from a host configure (a resize by the X
+    // client, an output scale change) re-anchor open popups as well, without inventing a
+    // parent configure serial.
+    let (mut f, compositor) = TestFixture::new_with_compositor();
+    let (_, output) = f.new_output(0, 0);
+    f.run();
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&compositor, window);
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+    f.testwl
+        .force_decoration_mode(id, zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+    let popup = Window::new(2);
+    let (_, p_id) = f.create_popup(
+        &compositor,
+        PopupBuilder::new(popup, window, id)
+            .x(10)
+            .y(20)
+            .check_size_and_pos(false),
+    );
+    let titlebar = super::decoration::DecorationsDataSatellite::TITLEBAR_HEIGHT;
+    // (anchor origin, anchor size, parent size, parent configure serial)
+    let anchor = |f: &TestFixture<FakeXConnection>| {
+        let data = f.testwl.get_surface_data(p_id).unwrap();
+        let pos = &data.popup().positioner_state;
+        let rect = pos.anchor_rect.as_ref().unwrap();
+        (
+            rect.offset,
+            rect.size,
+            pos.parent_size,
+            pos.parent_configure,
+        )
+    };
+    let v = |x, y| testwl::Vec2 { x, y };
+    assert_eq!(anchor(&f).0, v(0, titlebar));
+    assert_eq!(anchor(&f).1, v(100, 75));
+
+    // The X client resizes its window: the content is now 80x60.
+    f.reconfigure_window(
+        window,
+        WindowDims {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 60,
+        },
+        false,
+    );
+    f.run();
+    f.run();
+    assert_eq!(
+        anchor(&f),
+        (v(0, titlebar), v(80, 60), Some(v(80, 60 + titlebar)), None)
+    );
+
+    // The output's scale changes: the same X window is now 40x30 logical.
+    output.scale(2);
+    output.done();
+    f.run();
+    f.run();
+    assert_eq!(
+        anchor(&f),
+        (v(0, titlebar), v(40, 30), Some(v(40, 30 + titlebar)), None)
+    );
+}
+
+#[test]
 fn client_side_decorations_no_global() {
     let mut f = TestFixture::new_pre_connect(|testwl| {
         testwl.disable_decorations_global();

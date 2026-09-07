@@ -542,6 +542,9 @@ pub struct InnerServerState<S: X11Selection> {
     global_output_offset: GlobalOutputOffset,
     global_offset_updated: bool,
     updated_outputs: Vec<Entity>,
+    /// Toplevels whose logical geometry changed outside of a host configure; their popups are
+    /// re-anchored when events have been handled.
+    pending_popup_refresh: Vec<Entity>,
     new_scale: Option<f64>,
     current_scale: f64,
 }
@@ -651,6 +654,7 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             },
             global_offset_updated: false,
             updated_outputs: Vec::new(),
+            pending_popup_refresh: Vec::new(),
             new_scale: None,
             current_scale: 1.0,
             decoration_manager,
@@ -704,6 +708,8 @@ impl<C: XConnection> ServerState<C> {
             event.handle(target, self);
         }
 
+        self.refresh_pending_popups();
+
         let query = self.world.query_mut::<(&x::Window, &PendingSurfaceState)>();
         let iter = query
             .into_iter()
@@ -741,6 +747,7 @@ impl<C: XConnection> ServerState<C> {
         }
 
         if !self.updated_outputs.is_empty() {
+            let mut rescaled = Vec::new();
             for output in std::mem::take(&mut self.updated_outputs).iter() {
                 let Ok(output_scale) = self.world.get::<&OutputScaleFactor>(*output) else {
                     continue;
@@ -765,9 +772,12 @@ impl<C: XConnection> ServerState<C> {
                             &self.world,
                             self.world.query_one(surface).unwrap(),
                         );
+                        rescaled.push(surface);
                     }
                 }
             }
+            self.pending_popup_refresh.extend(rescaled);
+            self.refresh_pending_popups();
 
             let mut mixed_scale = false;
             let mut scale;
@@ -1170,6 +1180,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                 drop(query);
                 drop(win);
                 update_surface_viewport(&self.world, self.world.query_one(data.entity()).unwrap());
+                self.pending_popup_refresh.push(data.entity());
             }
             other => warn!("Non popup ({other:?}) being reconfigured, behavior may be off."),
         }
@@ -1629,12 +1640,19 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         }
     }
 
-    /// Re-anchors the popups of the given parent after it was configured, for when its
-    /// decorations or size changed (e.g. going fullscreen removes the titlebar). Popups whose
-    /// anchor is unchanged are left alone. `serial` is the parent's xdg_surface.configure
-    /// serial being responded to, which the compositor may use, together with the parent's
-    /// future window geometry, to constrain the repositioned popup (xdg_popup.reposition).
-    pub(super) fn refresh_child_popups(&mut self, parent: Entity, serial: u32) {
+    fn refresh_pending_popups(&mut self) {
+        for parent in std::mem::take(&mut self.pending_popup_refresh) {
+            self.refresh_child_popups(parent, None);
+        }
+    }
+
+    /// Re-anchors the popups of the given parent after its logical geometry may have changed
+    /// (a configure, a resize by the X client, a scale change; going fullscreen removes the
+    /// titlebar). Popups whose anchor is unchanged are left alone. `serial` is the parent's
+    /// xdg_surface.configure serial being responded to, if any, which the compositor may use,
+    /// together with the parent's future window geometry, to constrain the repositioned popup
+    /// (xdg_popup.reposition).
+    pub(super) fn refresh_child_popups(&mut self, parent: Entity, serial: Option<u32>) {
         if self.xdg_wm_base.version() < 3 {
             return;
         }
@@ -1685,7 +1703,9 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             popup
                 .positioner
                 .set_parent_size(width, height + anchor_origin.1);
-            popup.positioner.set_parent_configure(serial);
+            if let Some(serial) = serial {
+                popup.positioner.set_parent_configure(serial);
+            }
             popup.positioner.set_offset(
                 ((window.attrs.dims.x - parent_dims.x) as f64 / scale) as i32,
                 ((window.attrs.dims.y - parent_dims.y) as f64 / scale) as i32,

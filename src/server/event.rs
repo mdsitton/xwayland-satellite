@@ -117,6 +117,7 @@ impl Event for SurfaceEvents {
                             &state.world,
                             state.world.query_one(target).unwrap(),
                         );
+                        state.pending_popup_refresh.push(target);
                     }
                 }
                 _ => unreachable!(),
@@ -237,6 +238,7 @@ impl SurfaceEvents {
                             &state.world,
                             state.world.query_one(target).unwrap(),
                         );
+                        state.pending_popup_refresh.push(target);
                     } else {
                         let scale = data.get::<&SurfaceScaleFactor>().unwrap();
                         if update_output_scale(
@@ -364,7 +366,7 @@ impl SurfaceEvents {
             state.world.insert_one(target, pending).unwrap();
             update_surface_viewport(&state.world, state.world.query_one(target).unwrap());
             if is_toplevel {
-                state.refresh_child_popups(target, serial);
+                state.refresh_child_popups(target, Some(serial));
             }
         }
 
