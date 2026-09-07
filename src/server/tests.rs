@@ -3433,6 +3433,46 @@ fn popup_reanchored_on_undecorated_parent_resize() {
 }
 
 #[test]
+fn popup_above_parent_content_keeps_signed_position() {
+    // A popup placed within the titlebar's height sits above the parent's X content; its
+    // configured position is a negative content-relative offset, which must survive the
+    // conversion to X coordinates rather than being clamped to the content's top.
+    let (mut f, compositor) = TestFixture::new_with_compositor();
+    f.new_output(0, 0);
+    let (_, output) = f.new_output(500, 100);
+    f.run();
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&compositor, window);
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+    f.testwl
+        .force_decoration_mode(id, zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+    let parent = f.connection().window(window).dims;
+    assert_eq!((parent.x, parent.y, parent.height), (500, 100, 75));
+
+    // 15px above the content, i.e. 10px below the top of the titlebar.
+    let popup = Window::new(2);
+    let (_, p_id) = f.create_popup(
+        &compositor,
+        PopupBuilder::new(popup, window, id)
+            .x(510)
+            .y(85)
+            .check_size_and_pos(false),
+    );
+    f.testwl.move_surface_to_output(p_id, &output);
+    f.run();
+    let data = f.testwl.get_surface_data(p_id).unwrap();
+    assert_eq!(
+        data.popup().positioner_state.offset,
+        testwl::Vec2 { x: 10, y: -15 }
+    );
+    let dims = f.connection().window(popup).dims;
+    assert_eq!((dims.x, dims.y), (510, 85));
+}
+
+#[test]
 fn client_side_decorations_no_global() {
     let mut f = TestFixture::new_pre_connect(|testwl| {
         testwl.disable_decorations_global();
