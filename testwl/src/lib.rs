@@ -262,6 +262,10 @@ struct State {
     surfaces: HashMap<SurfaceId, SurfaceData>,
     outputs: HashMap<WlOutput, Output>,
     positioners: HashMap<PositionerId, PositionerState>,
+    /// Replies to xdg_popup.reposition are held back until released, keeping the positioner
+    /// state each request was made with.
+    hold_reposition_replies: bool,
+    held_repositions: std::collections::VecDeque<(SurfaceId, u32, PositionerState)>,
     buffers: HashMap<WlBuffer, Vec2>,
     begin: Instant,
     last_surface_id: Option<SurfaceId>,
@@ -296,6 +300,8 @@ impl Default for State {
             outputs: Default::default(),
             buffers: Default::default(),
             positioners: Default::default(),
+            hold_reposition_replies: false,
+            held_repositions: Default::default(),
             begin: Instant::now(),
             last_surface_id: None,
             last_output: None,
@@ -652,6 +658,40 @@ impl Server {
     pub fn configure_popup(&mut self, surface_id: SurfaceId) {
         self.state.configure_popup(surface_id);
         self.display.flush_clients().unwrap();
+    }
+
+    /// Holds back replies to xdg_popup.reposition until `release_reposition_reply`.
+    pub fn hold_reposition_replies(&mut self, hold: bool) {
+        self.state.hold_reposition_replies = hold;
+    }
+
+    /// Replies to the oldest held reposition with the positioner state it was requested
+    /// with. Returns false if none is held.
+    pub fn release_reposition_reply(&mut self) -> bool {
+        let Some((surface_id, token, positioner)) = self.state.held_repositions.pop_front() else {
+            return false;
+        };
+        let surface = self.state.surfaces.get_mut(&surface_id).unwrap();
+        let Some(SurfaceRole::Popup(p)) = &mut surface.role else {
+            panic!("Surface does not have popup role: {:?}", surface.role);
+        };
+        let size = positioner.size.unwrap();
+        let anchor = positioner
+            .anchor_rect
+            .as_ref()
+            .map(|r| r.offset)
+            .unwrap_or_default();
+        p.popup.repositioned(token);
+        p.popup.configure(
+            anchor.x + positioner.offset.x,
+            anchor.y + positioner.offset.y,
+            size.x,
+            size.y,
+        );
+        p.xdg.configure(self.state.configure_serial);
+        self.state.configure_serial += 1;
+        self.display.flush_clients().unwrap();
+        true
     }
 
     #[track_caller]
@@ -1531,8 +1571,15 @@ impl Dispatch<XdgPopup, SurfaceId> for State {
                 let positioner_data =
                     &state.positioners[&PositionerId(positioner.id().protocol_id())];
                 p.positioner_state = positioner_data.clone();
-                p.popup.repositioned(token);
-                state.configure_popup(*surface_id);
+                if state.hold_reposition_replies {
+                    let positioner_state = positioner_data.clone();
+                    state
+                        .held_repositions
+                        .push_back((*surface_id, token, positioner_state));
+                } else {
+                    p.popup.repositioned(token);
+                    state.configure_popup(*surface_id);
+                }
             }
             other => todo!("unhandled request {other:?}"),
         }

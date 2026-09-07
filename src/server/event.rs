@@ -303,7 +303,7 @@ impl SurfaceEvents {
             // Popup positions are relative to the parent's window geometry; make them relative
             // to the parent's X window (see PopupData::anchor_origin).
             let (anchor_x, anchor_y) = match role {
-                SurfaceRole::Popup(Some(popup)) => popup.anchor_origin,
+                SurfaceRole::Popup(Some(popup)) => popup.configure_anchor,
                 _ => (0, 0),
             };
             // The content-relative position may be negative (a popup above the parent's
@@ -481,7 +481,13 @@ impl SurfaceEvents {
                     }
                 }
             }
-            xdg_popup::Event::Repositioned { .. } => {}
+            xdg_popup::Event::Repositioned { token } => {
+                if let Some(SurfaceRole::Popup(Some(popup))) =
+                    data.get::<&mut SurfaceRole>().as_deref_mut()
+                {
+                    popup.repositioned(token);
+                }
+            }
             xdg_popup::Event::PopupDone => {
                 state
                     .connection

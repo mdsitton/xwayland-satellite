@@ -254,6 +254,32 @@ struct PopupData {
     anchor_origin: (i32, i32),
     /// Size of the positioner's anchor rect, i.e. the parent's X window content size.
     anchor_size: (i32, i32),
+    /// The anchor origin the next configure was positioned with. Repositions are answered
+    /// asynchronously, so this lags `anchor_origin` until the matching repositioned event.
+    configure_anchor: (i32, i32),
+    /// Anchor origins of repositions not yet answered, by token.
+    pending_anchors: Vec<(u32, (i32, i32))>,
+    next_reposition_token: u32,
+}
+
+impl PopupData {
+    /// Repositions with the current positioner, remembering which anchor origin the
+    /// response is to be converted with.
+    fn reposition(&mut self) {
+        let token = self.next_reposition_token;
+        self.next_reposition_token = self.next_reposition_token.wrapping_add(1);
+        self.pending_anchors.push((token, self.anchor_origin));
+        self.popup.reposition(&self.positioner, token);
+    }
+
+    /// The compositor answered the reposition with this token (earlier ones may have been
+    /// skipped); the following configure is positioned with that request's anchor.
+    fn repositioned(&mut self, token: u32) {
+        if let Some(index) = self.pending_anchors.iter().position(|(t, _)| *t == token) {
+            self.configure_anchor = self.pending_anchors[index].1;
+            self.pending_anchors.drain(..=index);
+        }
+    }
 }
 
 /// Returns the origin and size of the area popups of the given parent are anchored to, in the
@@ -1136,7 +1162,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                     1.max((event.width() as f64 / scale_factor.0) as i32),
                     1.max((event.height() as f64 / scale_factor.0) as i32),
                 );
-                popup.popup.reposition(&popup.positioner, 0);
+                popup.reposition();
             }
             SurfaceRole::Toplevel(Some(_)) => {
                 win.attrs.dims.width = dims.width;
@@ -1664,7 +1690,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                 ((window.attrs.dims.x - parent_dims.x) as f64 / scale) as i32,
                 ((window.attrs.dims.y - parent_dims.y) as f64 / scale) as i32,
             );
-            popup.popup.reposition(&popup.positioner, 0);
+            popup.reposition();
         }
     }
 
@@ -1726,6 +1752,9 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             parent: self.windows[&parent],
             anchor_origin,
             anchor_size: (parent_width, parent_height),
+            configure_anchor: anchor_origin,
+            pending_anchors: Vec::new(),
+            next_reposition_token: 1,
             xdg: XdgSurfaceData {
                 surface: xdg,
                 configured: false,

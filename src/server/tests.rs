@@ -162,6 +162,7 @@ struct FakeXConnection {
     focused_window: Option<Window>,
     windows: HashMap<Window, WindowData>,
     set_window_dims_counter: usize,
+    dims_history: Vec<(Window, WindowDims)>,
 }
 
 impl FakeXConnection {
@@ -215,12 +216,14 @@ impl super::XConnection for FakeXConnection {
 
     #[track_caller]
     fn set_window_dims(&mut self, window: Window, state: super::PendingSurfaceState) -> bool {
-        self.window_mut(window).dims = WindowDims {
+        let dims = WindowDims {
             x: state.x as _,
             y: state.y as _,
             width: state.width as _,
             height: state.height as _,
         };
+        self.window_mut(window).dims = dims;
+        self.dims_history.push((window, dims));
         self.set_window_dims_counter += 1;
         true
     }
@@ -3470,6 +3473,54 @@ fn popup_above_parent_content_keeps_signed_position() {
     );
     let dims = f.connection().window(popup).dims;
     assert_eq!((dims.x, dims.y), (510, 85));
+}
+
+#[test]
+fn popup_configures_use_the_anchor_they_were_requested_with() {
+    // Two repositions in flight with different anchors (entering and leaving fullscreen
+    // before the first response arrives): each response must be converted with the anchor
+    // its request used, not the latest one.
+    let (mut f, compositor) = TestFixture::new_with_compositor();
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&compositor, window);
+    f.testwl
+        .force_decoration_mode(id, zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+    let popup = Window::new(2);
+    f.create_popup(
+        &compositor,
+        PopupBuilder::new(popup, window, id)
+            .x(10)
+            .y(20)
+            .check_size_and_pos(false),
+    );
+    f.satellite.connection.dims_history.clear();
+
+    // Both repositions are requested before either is answered; the answers then arrive
+    // one per run, each with the positioner state of its own request.
+    f.testwl.hold_reposition_replies(true);
+    f.testwl
+        .configure_toplevel(id, 100, 100, vec![xdg_toplevel::State::Fullscreen]);
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+    f.run();
+    let mut positions = Vec::new();
+    while f.testwl.release_reposition_reply() {
+        f.run();
+        f.run();
+        positions.extend(
+            std::mem::take(&mut f.satellite.connection.dims_history)
+                .into_iter()
+                .filter(|(w, _)| *w == popup)
+                .map(|(_, d)| (d.x, d.y)),
+        );
+    }
+    assert_eq!(
+        positions,
+        [(10, 20), (10, 20)],
+        "a configure was converted with the wrong anchor"
+    );
 }
 
 #[test]
