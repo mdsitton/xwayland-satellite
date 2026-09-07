@@ -2607,6 +2607,8 @@ fn fractional_scale_small_popup() {
     };
     f.reconfigure_window(popup, dims, true);
     f.run();
+    // The reposition is answered with a configure, which is what updates the viewport.
+    f.run();
 
     let dims = f.connection().window(popup).dims;
     assert!(dims.width > 0);
@@ -2617,7 +2619,10 @@ fn fractional_scale_small_popup() {
         .get_surface_data(popup_id)
         .expect("Missing popup data");
     let pos = &data.popup().positioner_state;
+    // Rounded up like the viewport.
     assert_eq!(pos.size.unwrap(), testwl::Vec2 { x: 2, y: 1 });
+    let viewport = data.viewport.as_ref().expect("Missing viewport");
+    assert_eq!((viewport.width, viewport.height), (2, 1));
 }
 
 #[test]
@@ -3764,6 +3769,14 @@ fn popup_keeps_its_x_geometry_across_reanchors_at_fractional_scale() {
         f.run();
         f.run();
         assert_eq!(f.connection().window(popup).dims, expected);
+        // 50 / 1.3 rounded up, in the positioner and the viewport alike.
+        let data = f.testwl.get_surface_data(p_id).unwrap();
+        assert_eq!(
+            data.popup().positioner_state.size,
+            Some(testwl::Vec2 { x: 39, y: 39 })
+        );
+        let viewport = data.viewport.as_ref().expect("Missing viewport");
+        assert_eq!((viewport.width, viewport.height), (39, 39));
     }
 }
 
@@ -3803,15 +3816,13 @@ fn popup_keeps_odd_x_size_across_scale_change() {
     f.run();
     f.run();
     assert_eq!(f.connection().window(popup).dims, expected);
+    let data = f.testwl.get_surface_data(p_id).unwrap();
     assert_eq!(
-        f.testwl
-            .get_surface_data(p_id)
-            .unwrap()
-            .popup()
-            .positioner_state
-            .size,
+        data.popup().positioner_state.size,
         Some(testwl::Vec2 { x: 26, y: 26 })
     );
+    let viewport = data.viewport.as_ref().expect("Missing viewport");
+    assert_eq!((viewport.width, viewport.height), (26, 26));
 
     output.scale(1);
     output.done();
