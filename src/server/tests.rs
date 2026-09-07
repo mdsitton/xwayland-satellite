@@ -3526,8 +3526,9 @@ fn popup_configures_use_the_anchor_they_were_requested_with() {
 #[test]
 fn popup_reanchored_on_x_resize_and_scale_change() {
     // Parent geometry changes that do not come from a host configure (a resize by the X
-    // client, an output scale change) re-anchor open popups as well, without inventing a
-    // parent configure serial.
+    // client, an output scale change) re-anchor open popups as well, without a parent
+    // configure serial, and a scale change keeps the popup's X size by requesting its new
+    // logical size.
     let (mut f, compositor) = TestFixture::new_with_compositor();
     let (_, output) = f.new_output(0, 0);
     f.run();
@@ -3547,24 +3548,49 @@ fn popup_reanchored_on_x_resize_and_scale_change() {
             .y(20)
             .check_size_and_pos(false),
     );
+    f.testwl.move_surface_to_output(p_id, &output);
+    f.run();
     let titlebar = super::decoration::DecorationsDataSatellite::TITLEBAR_HEIGHT;
-    // (anchor origin, anchor size, parent size, parent configure serial)
-    let anchor = |f: &TestFixture<FakeXConnection>| {
+    // (anchor origin, anchor size, popup size, parent size, parent configure serial)
+    let state = |f: &TestFixture<FakeXConnection>| {
         let data = f.testwl.get_surface_data(p_id).unwrap();
         let pos = &data.popup().positioner_state;
         let rect = pos.anchor_rect.as_ref().unwrap();
         (
             rect.offset,
             rect.size,
+            pos.size.unwrap(),
             pos.parent_size,
             pos.parent_configure,
         )
     };
     let v = |x, y| testwl::Vec2 { x, y };
-    assert_eq!(anchor(&f).0, v(0, titlebar));
-    assert_eq!(anchor(&f).1, v(100, 75));
+    assert_eq!(state(&f).0, v(0, titlebar));
+    assert_eq!(state(&f).1, v(100, 75));
 
-    // The X client resizes its window: the content is now 80x60.
+    // A host configure re-anchors in response to that configure...
+    f.testwl.configure_toplevel(id, 100, 90, vec![]);
+    f.run();
+    f.run();
+    let serial = f
+        .testwl
+        .get_surface_data(id)
+        .unwrap()
+        .xdg()
+        .last_configure_serial;
+    assert_eq!(
+        state(&f),
+        (
+            v(0, titlebar),
+            v(100, 65),
+            v(50, 50),
+            Some(v(100, 90)),
+            Some(serial)
+        )
+    );
+
+    // ...but a resize by the X client is not in response to any configure. The content is
+    // now 80x60.
     f.reconfigure_window(
         window,
         WindowDims {
@@ -3578,19 +3604,55 @@ fn popup_reanchored_on_x_resize_and_scale_change() {
     f.run();
     f.run();
     assert_eq!(
-        anchor(&f),
-        (v(0, titlebar), v(80, 60), Some(v(80, 60 + titlebar)), None)
+        state(&f),
+        (
+            v(0, titlebar),
+            v(80, 60),
+            v(50, 50),
+            Some(v(80, 60 + titlebar)),
+            None
+        )
     );
 
-    // The output's scale changes: the same X window is now 40x30 logical.
+    // The output's scale changes: the same X windows are now half the logical size. The
+    // popup's requested size follows, so that it keeps its X size.
     output.scale(2);
     output.done();
     f.run();
     f.run();
     assert_eq!(
-        anchor(&f),
-        (v(0, titlebar), v(40, 30), Some(v(40, 30 + titlebar)), None)
+        state(&f),
+        (
+            v(0, titlebar),
+            v(40, 30),
+            v(25, 25),
+            Some(v(40, 30 + titlebar)),
+            None
+        )
     );
+    let dims = f.connection().window(popup).dims;
+    assert_eq!(
+        (dims.width, dims.height),
+        (50, 50),
+        "popup was resized by the rescale"
+    );
+
+    output.scale(1);
+    output.done();
+    f.run();
+    f.run();
+    assert_eq!(
+        state(&f),
+        (
+            v(0, titlebar),
+            v(80, 60),
+            v(50, 50),
+            Some(v(80, 60 + titlebar)),
+            None
+        )
+    );
+    let dims = f.connection().window(popup).dims;
+    assert_eq!((dims.width, dims.height), (50, 50));
 }
 
 #[test]

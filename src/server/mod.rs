@@ -245,15 +245,25 @@ struct ToplevelData {
 #[derive(Debug)]
 struct PopupData {
     popup: XdgPopup,
+    /// The positioner last used; a new one is built from the fields below for each
+    /// reposition, so that no stale state (e.g. a parent configure serial) is carried over.
     positioner: XdgPositioner,
     xdg: XdgSurfaceData,
     parent: Entity,
+    /// The popup's logical size.
+    size: (i32, i32),
+    /// The popup's offset from the anchor, in the parent's logical coordinates.
+    offset: (i32, i32),
     /// Origin of the positioner's anchor rect within the parent's window geometry, i.e. where
     /// the parent's X window content starts. This is non-zero when satellite draws the parent's
     /// titlebar, which is part of the parent's window geometry but not of its X window.
     anchor_origin: (i32, i32),
     /// Size of the positioner's anchor rect, i.e. the parent's X window content size.
     anchor_size: (i32, i32),
+    /// The parent's future window geometry (content plus titlebar) to constrain against, and
+    /// the parent's configure serial a reposition responds to, if any.
+    parent_size: Option<(i32, i32)>,
+    parent_configure: Option<u32>,
     /// The anchor origin the next configure was positioned with. Repositions are answered
     /// asynchronously, so this lags `anchor_origin` until the matching repositioned event.
     configure_anchor: (i32, i32),
@@ -262,14 +272,62 @@ struct PopupData {
     next_reposition_token: u32,
 }
 
+/// Sets a positioner up for a popup of the given logical size at `offset` from the anchor
+/// rect, which is the parent's X content area within its window geometry.
+fn set_up_positioner(
+    positioner: &XdgPositioner,
+    size: (i32, i32),
+    offset: (i32, i32),
+    anchor_origin: (i32, i32),
+    anchor_size: (i32, i32),
+    parent_size: Option<(i32, i32)>,
+    parent_configure: Option<u32>,
+) {
+    positioner.set_size(size.0, size.1);
+    positioner.set_offset(offset.0, offset.1);
+    positioner.set_anchor(Anchor::TopLeft);
+    positioner.set_gravity(Gravity::BottomRight);
+    positioner.set_anchor_rect(
+        anchor_origin.0,
+        anchor_origin.1,
+        anchor_size.0,
+        anchor_size.1,
+    );
+    positioner
+        .set_constraint_adjustment(ConstraintAdjustment::SlideX | ConstraintAdjustment::SlideY);
+    if let Some((width, height)) = parent_size {
+        positioner.set_parent_size(width, height);
+    }
+    if let Some(serial) = parent_configure {
+        positioner.set_parent_configure(serial);
+    }
+}
+
 impl PopupData {
-    /// Repositions with the current positioner, remembering which anchor origin the
-    /// response is to be converted with.
-    fn reposition(&mut self) {
+    /// Sets the positioner up from the popup's current state.
+    fn configure_positioner(&self, positioner: &XdgPositioner) {
+        set_up_positioner(
+            positioner,
+            self.size,
+            self.offset,
+            self.anchor_origin,
+            self.anchor_size,
+            self.parent_size,
+            self.parent_configure,
+        );
+    }
+
+    /// Repositions with a positioner built from the current state, remembering which anchor
+    /// origin the response is to be converted with.
+    fn reposition(&mut self, wm_base: &XdgWmBase, qh: &QueueHandle<MyWorld>) {
+        let positioner = wm_base.create_positioner(qh, ());
+        self.configure_positioner(&positioner);
         let token = self.next_reposition_token;
         self.next_reposition_token = self.next_reposition_token.wrapping_add(1);
         self.pending_anchors.push((token, self.anchor_origin));
-        self.popup.reposition(&self.positioner, token);
+        self.popup.reposition(&positioner, token);
+        self.positioner.destroy();
+        self.positioner = positioner;
     }
 
     /// The compositor answered the reposition with this token (earlier ones may have been
@@ -1164,15 +1222,17 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
 
         match role {
             SurfaceRole::Popup(Some(popup)) => {
-                popup.positioner.set_offset(
+                popup.offset = (
                     ((event.x() as i32 - win.output_offset.x) as f64 / scale_factor.0) as i32,
                     ((event.y() as i32 - win.output_offset.y) as f64 / scale_factor.0) as i32,
                 );
-                popup.positioner.set_size(
+                popup.size = (
                     1.max((event.width() as f64 / scale_factor.0) as i32),
                     1.max((event.height() as f64 / scale_factor.0) as i32),
                 );
-                popup.reposition();
+                // Not in response to any configure of the parent.
+                popup.parent_configure = None;
+                popup.reposition(&self.xdg_wm_base, &self.qh);
             }
             SurfaceRole::Toplevel(Some(_)) => {
                 win.attrs.dims.width = dims.width;
@@ -1641,7 +1701,19 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
     }
 
     fn refresh_pending_popups(&mut self) {
-        for parent in std::mem::take(&mut self.pending_popup_refresh) {
+        let mut parents = Vec::new();
+        for entity in std::mem::take(&mut self.pending_popup_refresh) {
+            // A popup whose own geometry (e.g. scale) changed is refreshed through its parent.
+            if let Ok(SurfaceRole::Popup(Some(popup))) =
+                self.world.get::<&SurfaceRole>(entity).as_deref()
+            {
+                parents.push(popup.parent);
+            }
+            parents.push(entity);
+        }
+        parents.sort_unstable();
+        parents.dedup();
+        for parent in parents {
             self.refresh_child_popups(parent, None);
         }
     }
@@ -1681,36 +1753,40 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             .collect();
 
         for entity in children {
-            let Ok((role, window)) = self
-                .world
-                .query_one_mut::<(&mut SurfaceRole, &WindowData)>(entity)
+            let Ok((role, window, popup_scale)) =
+                self.world
+                    .query_one_mut::<(&mut SurfaceRole, &WindowData, &SurfaceScaleFactor)>(entity)
             else {
                 continue;
             };
             let SurfaceRole::Popup(Some(popup)) = role else {
                 continue;
             };
-            if popup.anchor_origin == anchor_origin && popup.anchor_size == (width, height) {
+            // The popup's logical size follows its own scale, so that a scale change keeps
+            // its X size rather than resizing it.
+            let size = (
+                1.max((window.attrs.dims.width as f64 / popup_scale.0) as i32),
+                1.max((window.attrs.dims.height as f64 / popup_scale.0) as i32),
+            );
+            if popup.anchor_origin == anchor_origin
+                && popup.anchor_size == (width, height)
+                && popup.size == size
+                && serial.is_none()
+            {
                 continue;
             }
             debug!("re-anchoring popup {entity:?} to {anchor_origin:?} {width}x{height}");
             popup.anchor_origin = anchor_origin;
             popup.anchor_size = (width, height);
-            popup
-                .positioner
-                .set_anchor_rect(anchor_origin.0, anchor_origin.1, width, height);
+            popup.size = size;
             // The parent's window geometry is its content plus the titlebar above it.
-            popup
-                .positioner
-                .set_parent_size(width, height + anchor_origin.1);
-            if let Some(serial) = serial {
-                popup.positioner.set_parent_configure(serial);
-            }
-            popup.positioner.set_offset(
+            popup.parent_size = Some((width, height + anchor_origin.1));
+            popup.parent_configure = serial;
+            popup.offset = (
                 ((window.attrs.dims.x - parent_dims.x) as f64 / scale) as i32,
                 ((window.attrs.dims.y - parent_dims.y) as f64 / scale) as i32,
             );
-            popup.reposition();
+            popup.reposition(&self.xdg_wm_base, &self.qh);
         }
     }
 
@@ -1741,24 +1817,24 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         let (anchor_origin, (parent_width, parent_height)) =
             popup_anchor(parent_role, parent_dims, initial_scale);
 
-        let positioner = self.xdg_wm_base.create_positioner(&self.qh, ());
-        positioner.set_size(
+        let size = (
             1.max((window.attrs.dims.width as f64 / initial_scale) as i32),
             1.max((window.attrs.dims.height as f64 / initial_scale) as i32),
         );
-        let x = ((window.attrs.dims.x - parent_dims.x) as f64 / initial_scale) as i32;
-        let y = ((window.attrs.dims.y - parent_dims.y) as f64 / initial_scale) as i32;
-        positioner.set_offset(x, y);
-        positioner.set_anchor(Anchor::TopLeft);
-        positioner.set_gravity(Gravity::BottomRight);
-        positioner.set_anchor_rect(
-            anchor_origin.0,
-            anchor_origin.1,
-            parent_width,
-            parent_height,
+        let offset = (
+            ((window.attrs.dims.x - parent_dims.x) as f64 / initial_scale) as i32,
+            ((window.attrs.dims.y - parent_dims.y) as f64 / initial_scale) as i32,
         );
-        positioner
-            .set_constraint_adjustment(ConstraintAdjustment::SlideX | ConstraintAdjustment::SlideY);
+        let positioner = self.xdg_wm_base.create_positioner(&self.qh, ());
+        set_up_positioner(
+            &positioner,
+            size,
+            offset,
+            anchor_origin,
+            (parent_width, parent_height),
+            None,
+            None,
+        );
         let popup = xdg.get_popup(
             Some(&parent_role.xdg().unwrap().surface),
             &positioner,
@@ -1766,12 +1842,16 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             entity,
         );
 
-        PopupData {
+        let data = PopupData {
             popup,
             positioner,
             parent: self.windows[&parent],
+            size,
+            offset,
             anchor_origin,
             anchor_size: (parent_width, parent_height),
+            parent_size: None,
+            parent_configure: None,
             configure_anchor: anchor_origin,
             pending_anchors: Vec::new(),
             next_reposition_token: 1,
@@ -1780,7 +1860,8 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                 configured: false,
                 pending: None,
             },
-        }
+        };
+        data
     }
 }
 
