@@ -3077,6 +3077,25 @@ fn disconnected_output_rescaling() {
     assert_eq!(f.satellite.inner.new_scale, Some(2.0));
 }
 
+#[track_caller]
+fn check_window_and_viewport_size(
+    f: &TestFixture<FakeXConnection>,
+    window: Window,
+    id: testwl::SurfaceId,
+    width: u16,
+    height: u16,
+) {
+    let dims = f.connection().window(window).dims;
+    assert_eq!((dims.width, dims.height), (width, height), "X window size");
+    let data = f.testwl.get_surface_data(id).unwrap();
+    let viewport = data.viewport.as_ref().unwrap();
+    assert_eq!(
+        (viewport.width, viewport.height),
+        (width as i32, height as i32),
+        "viewport size"
+    );
+}
+
 #[test]
 fn client_side_decorations() {
     let (mut f, compositor) = TestFixture::new_with_compositor();
@@ -3087,10 +3106,7 @@ fn client_side_decorations() {
     f.testwl.configure_toplevel(id, 100, 100, vec![]);
     f.run();
 
-    let data = f.testwl.get_surface_data(id).unwrap();
-    let viewport = data.viewport.as_ref().unwrap();
-    assert_eq!(viewport.width, 100);
-    assert_eq!(viewport.height, 75);
+    check_window_and_viewport_size(&f, window, id, 100, 75);
 
     let subsurface_id = f.testwl.last_created_surface_id().unwrap();
     assert_ne!(subsurface_id, id);
@@ -3106,10 +3122,7 @@ fn client_side_decorations() {
     f.testwl
         .configure_toplevel(id, 100, 100, vec![xdg_toplevel::State::Fullscreen]);
     f.run();
-    let data = f.testwl.get_surface_data(id).unwrap();
-    let viewport = data.viewport.as_ref().unwrap();
-    assert_eq!(viewport.width, 100);
-    assert_eq!(viewport.height, 100);
+    check_window_and_viewport_size(&f, window, id, 100, 100);
 
     let data = f.testwl.get_surface_data(subsurface_id).unwrap();
     assert!(data.buffer.is_none());
@@ -3126,12 +3139,52 @@ fn client_side_decorations() {
     f.testwl.configure_toplevel(id, 100, 100, vec![]);
     f.run();
 
-    let data = f.testwl.get_surface_data(id).unwrap();
-    let viewport = data.viewport.as_ref().unwrap();
-    assert_eq!(viewport.width, 100);
-    assert_eq!(viewport.height, 100);
+    check_window_and_viewport_size(&f, window, id, 100, 100);
     assert!(f.testwl.get_surface_data(subsurface_id).is_none());
     assert!(!subsurface.is_alive());
+}
+
+#[test]
+fn client_side_decorations_fractional_scale() {
+    // The titlebar is subtracted in logical pixels, so the X window content and the viewport
+    // agree at fractional scales as well (scale, preferred_scale value, expected X height).
+    for (scale, preferred, x_height) in [(1.5, 180, 112), (1.25, 150, 93)] {
+        let mut f = TestFixture::new_pre_connect(|testwl| {
+            testwl.enable_fractional_scale();
+        });
+        let compositor = f.compositor();
+        let (_, output) = f.new_output(0, 0);
+        let window = Window::new(1);
+        let (_, id) = f.create_toplevel(&compositor, window);
+        let data = f.testwl.get_surface_data(id).unwrap();
+        data.fractional
+            .as_ref()
+            .expect("Missing fractional scale")
+            .preferred_scale(preferred);
+        f.testwl.move_surface_to_output(id, &output);
+        f.run();
+        f.run();
+
+        f.testwl
+            .force_decoration_mode(id, zxdg_toplevel_decoration_v1::Mode::ClientSide);
+        f.testwl.configure_toplevel(id, 100, 100, vec![]);
+        f.run();
+        f.run();
+
+        let dims = f.connection().window(window).dims;
+        assert_eq!(
+            (dims.width, dims.height),
+            ((100.0 * scale) as u16, x_height),
+            "X window size at scale {scale}"
+        );
+        let data = f.testwl.get_surface_data(id).unwrap();
+        let viewport = data.viewport.as_ref().unwrap();
+        assert_eq!(
+            (viewport.width, viewport.height),
+            (100, 75),
+            "viewport size at scale {scale}"
+        );
+    }
 }
 
 #[test]
@@ -3193,10 +3246,7 @@ fn resize_decorations_on_reconfigure() {
     f.testwl.configure_toplevel(id, 100, 100, vec![]);
     f.run();
 
-    let data = f.testwl.get_surface_data(id).unwrap();
-    let viewport = data.viewport.as_ref().unwrap();
-    assert_eq!(viewport.width, 100);
-    assert_eq!(viewport.height, 75);
+    check_window_and_viewport_size(&f, window, id, 100, 75);
 
     let subsurface_id = f.testwl.last_created_surface_id().unwrap();
     assert_ne!(subsurface_id, id);
@@ -3215,10 +3265,7 @@ fn resize_decorations_on_reconfigure() {
     // is used as a fallback in this case, do not reapply the height reduction from the titlebar.
     f.testwl.configure_toplevel(id, 0, 0, vec![]);
     f.run();
-    let data = f.testwl.get_surface_data(id).unwrap();
-    let viewport = data.viewport.as_ref().unwrap();
-    assert_eq!(viewport.width, 100);
-    assert_eq!(viewport.height, 75);
+    check_window_and_viewport_size(&f, window, id, 100, 75);
 
     let dims = WindowDims {
         x: 0,
@@ -3229,6 +3276,15 @@ fn resize_decorations_on_reconfigure() {
     f.reconfigure_window(window, dims, false);
     f.run();
     f.run();
+
+    // A resize from the X side must not be squished by the titlebar height.
+    let data = f.testwl.get_surface_data(id).unwrap();
+    let viewport = data.viewport.as_ref().unwrap();
+    assert_eq!(
+        (viewport.width, viewport.height),
+        (200, 200),
+        "viewport size"
+    );
 
     let data = f.testwl.get_surface_data(subsurface_id).unwrap();
     let buf_dims = f
