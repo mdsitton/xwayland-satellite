@@ -127,10 +127,12 @@ impl DecorationsDataSatellite {
     }
 
     /// Commits the titlebar together with the parent's next commit. Used for changes that must
-    /// stay in step with the X window, such as a resize (#268).
-    fn update_buffer(&mut self, world: &World) {
-        self.update_buffer_inner(world);
+    /// stay in step with the X window, such as a resize (#268). The titlebar's new geometry
+    /// (pixmap, viewport) is prepared before the upload and would be applied by any later
+    /// commit, so it must wait for the parent whether or not this upload succeeded.
+    fn update_buffer(&mut self, world: &World) -> bool {
         self.awaiting_parent_commit = true;
+        self.update_buffer_inner(world)
     }
 
     /// Commits the titlebar on its own, for changes the parent will not repaint for, such as
@@ -139,14 +141,14 @@ impl DecorationsDataSatellite {
     /// the change unapplied indefinitely. Switch to desynchronized mode for the commit, unless
     /// a synchronized commit is still waiting on the parent, in which case that commit must
     /// not be applied early and this change simply joins it.
-    fn update_buffer_independently(&mut self, world: &World) {
+    fn update_buffer_independently(&mut self, world: &World) -> bool {
         if self.awaiting_parent_commit {
-            self.update_buffer_inner(world);
-            return;
+            return self.update_buffer_inner(world);
         }
         self.subsurface.set_desync();
-        self.update_buffer_inner(world);
+        let uploaded = self.update_buffer_inner(world);
         self.subsurface.set_sync();
+        uploaded
     }
 
     /// The parent surface committed, applying whatever titlebar state was cached with it.
@@ -154,7 +156,9 @@ impl DecorationsDataSatellite {
         self.awaiting_parent_commit = false;
     }
 
-    fn update_buffer_inner(&mut self, world: &World) {
+    /// Uploads the pixmap and commits it. Returns whether that happened; a failed upload leaves
+    /// the previous buffer in place and nothing pending.
+    fn update_buffer_inner(&mut self, world: &World) -> bool {
         let mut pool = self.pool(world);
         let (buffer, data) = match pool.create_buffer(
             self.pixmap.width() as i32,
@@ -165,13 +169,14 @@ impl DecorationsDataSatellite {
             Ok(b) => b,
             Err(err) => {
                 error!("Failed to create buffer for decorations: {err:?}");
-                return;
+                return false;
             }
         };
 
         draw_pixmap_to_buffer(&self.pixmap, data);
         buffer.attach_to(&self.surface).unwrap();
         self.surface.commit();
+        true
     }
 
     #[must_use]
@@ -199,7 +204,6 @@ impl DecorationsDataSatellite {
         if self.last_drawn.as_ref() == Some(&drawn) {
             return;
         }
-        self.last_drawn = Some(drawn);
 
         self.scale = parent_scale_factor;
         let mut drawn_width = (width as f32 * self.scale).ceil() as i32;
@@ -257,7 +261,9 @@ impl DecorationsDataSatellite {
 
         self.pixmap = bar;
         self.viewport.set_destination(width, Self::TITLEBAR_HEIGHT);
-        self.update_buffer(world);
+        // Only a titlebar that was actually uploaded counts as drawn; otherwise the next
+        // request for the same values must try again.
+        self.last_drawn = self.update_buffer(world).then_some(drawn);
     }
 
     fn redraw_x_pixmap(&mut self, world: &World) {
@@ -286,9 +292,6 @@ impl DecorationsDataSatellite {
 
     pub fn set_title(&mut self, world: &World, title: &str) {
         self.title = Some(title.to_string());
-        if let Some(drawn) = self.last_drawn.as_mut() {
-            drawn.2 = self.title.clone();
-        }
         if !self.should_draw {
             return;
         }
@@ -331,7 +334,13 @@ impl DecorationsDataSatellite {
 
         self.surface
             .damage_buffer(0, 0, damaged_width as i32, damaged_height as i32);
-        self.update_buffer_independently(world);
+        if self.update_buffer_independently(world) {
+            if let Some(drawn) = self.last_drawn.as_mut() {
+                drawn.2 = self.title.clone();
+            }
+        } else {
+            self.last_drawn = None;
+        }
     }
 
     pub fn handle_fullscreen(&mut self, fullscreen: bool) {
