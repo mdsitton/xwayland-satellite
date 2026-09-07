@@ -1092,6 +1092,17 @@ fn send_xdg_logical_size(xdg: &XdgOutputServer, dimensions: &OutputDimensions) {
     }
 }
 
+/// Commits a logical size resent after the compositor's own xdg output events, for clients whose
+/// xdg output predates version 3. Those are committed by zxdg_output_v1.done, which the
+/// compositor has already sent by then; since version 3 the following wl_output.done commits
+/// everything. Sizes rewritten while forwarding the compositor's own logical_size event need
+/// nothing: the compositor's done follows them, as it does for the rest of its batch.
+fn commit_resent_xdg_logical_size(xdg: &XdgOutputServer) {
+    if xdg.version() < 3 {
+        xdg.done();
+    }
+}
+
 fn update_output_offset(
     output: Entity,
     source: OutputDimensionsSource,
@@ -1311,6 +1322,7 @@ impl OutputEvent {
                 });
                 if let Some(xdg) = xdg {
                     send_xdg_logical_size(xdg, dimensions);
+                    commit_resent_xdg_logical_size(xdg);
                 }
             }
             Event::Mode {
@@ -1342,6 +1354,7 @@ impl OutputEvent {
                     // following wl_output.done commits the size of the new mode.
                     if let Some(xdg) = xdg {
                         send_xdg_logical_size(xdg, dimensions);
+                        commit_resent_xdg_logical_size(xdg);
                     }
                 }
             }
