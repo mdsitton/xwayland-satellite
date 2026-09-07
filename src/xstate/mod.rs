@@ -448,8 +448,9 @@ impl XState {
 
                     let active_win: &[x::Window] = active_win.value();
                     if active_win[0] == e.window() {
-                        let restore_to = server_state.focus_restore_target();
-                        server_state.connection.focus_window(restore_to, None);
+                        // Applied on the next server_state.run(), according to the restored
+                        // window's input model.
+                        server_state.restore_focus();
                     }
 
                     unwrap_or_skip_bad_window_cont!(self.connection.send_and_check_request(
@@ -727,6 +728,7 @@ impl XState {
 
         let transient_for = self.get_transient_for(window)?;
         let override_redirect = self.get_override_redirect(window)?;
+        server_state.set_override_redirect(window, override_redirect);
 
         let window_types = self
             .get_net_wm_window_types(window)?
@@ -1084,7 +1086,7 @@ impl From<&[u32]> for WmNormalHints {
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub struct WmHints {
     pub window_group: Option<x::Window>,
-    pub acquire_input_via_wm: bool,
+    pub accepts_input: bool,
 }
 
 impl From<&[u32]> for WmHints {
@@ -1096,8 +1098,11 @@ impl From<&[u32]> for WmHints {
             let window = x::Window::new(value[8]);
             ret.window_group = Some(window);
         }
-        if flags.contains(WmHintsFlags::Input) {
-            ret.acquire_input_via_wm = value[1] == 1;
+
+        // if input hint isn't present, set it to true anyways in case the client is misbehaving
+        ret.accepts_input = true;
+        if flags.contains(WmHintsFlags::Input) && value[1] == 0 {
+            ret.accepts_input = false;
         }
 
         ret
@@ -1454,6 +1459,10 @@ impl XConnection for RealConnection {
             debug!("SetInputFocus failed ({window:?}: {e:?})");
             return;
         }
+        self.activate_window(window, output_name);
+    }
+
+    fn activate_window(&mut self, window: x::Window, output_name: Option<String>) {
         if let Err(e) = self.connection.send_and_check_request(&x::ChangeProperty {
             mode: x::PropMode::Replace,
             window: self.root_window(),
@@ -1501,6 +1510,22 @@ impl XConnection for RealConnection {
                 });
             self.primary_output = Xid::none();
         }
+    }
+
+    fn send_take_focus(&mut self, window: x::Window) {
+        let resource_id = self.atoms.wm_take_focus.resource_id();
+        let data = [resource_id, x::CURRENT_TIME, 0, 0, 0];
+        let event = &x::ClientMessageEvent::new(
+            window,
+            self.atoms.wm_protocols,
+            x::ClientMessageData::Data32(data),
+        );
+        unwrap_or_skip_bad_window_ret!(self.connection.send_and_check_request(&x::SendEvent {
+            destination: x::SendEventDest::Window(window),
+            propagate: false,
+            event_mask: x::EventMask::empty(),
+            event,
+        }));
     }
 
     fn close_window(&mut self, window: x::Window) {
