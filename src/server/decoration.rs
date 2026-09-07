@@ -46,6 +46,9 @@ pub struct DecorationsDataSatellite {
     /// Whether the titlebar was last committed in synchronized mode and the parent has not
     /// committed since, i.e. the compositor is still holding that titlebar state back.
     awaiting_parent_commit: bool,
+    /// What the titlebar was last drawn for: width, scale bits and title. A redraw for the
+    /// same values is skipped.
+    last_drawn: Option<(i32, u32, Option<String>)>,
     remove_buffer: bool,
 }
 
@@ -108,6 +111,7 @@ impl DecorationsDataSatellite {
                 should_draw: true,
                 remove_buffer: false,
                 awaiting_parent_commit: false,
+                last_drawn: None,
             }
             .into(),
             new_pool.map(|p| {
@@ -183,8 +187,19 @@ impl DecorationsDataSatellite {
                 self.awaiting_parent_commit = true;
                 self.remove_buffer = false;
             }
+            self.last_drawn = None;
             return;
         }
+
+        // The viewport is recomputed for events that need not change the titlebar, such as
+        // entering an output at the same scale. A synchronized recommit of the same content
+        // would wait for a parent commit that an idle client never makes, and hold back the
+        // independent redraws behind it (see update_buffer_independently).
+        let drawn = (width, parent_scale_factor.to_bits(), self.title.clone());
+        if self.last_drawn.as_ref() == Some(&drawn) {
+            return;
+        }
+        self.last_drawn = Some(drawn);
 
         self.scale = parent_scale_factor;
         let mut drawn_width = (width as f32 * self.scale).ceil() as i32;
@@ -268,6 +283,9 @@ impl DecorationsDataSatellite {
 
     pub fn set_title(&mut self, world: &World, title: &str) {
         self.title = Some(title.to_string());
+        if let Some(drawn) = self.last_drawn.as_mut() {
+            drawn.2 = self.title.clone();
+        }
         if !self.should_draw {
             return;
         }

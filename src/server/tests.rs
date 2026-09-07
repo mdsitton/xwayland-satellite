@@ -4605,6 +4605,45 @@ fn decoration_hover_redraw_applies_independently() {
 }
 
 #[test]
+fn decoration_not_redrawn_when_unchanged() {
+    // Entering an output at the same scale recomputes the viewport, which must not redraw and
+    // recommit an unchanged titlebar: that commit would wait for a parent commit that an idle
+    // client never makes, blocking hover updates behind it.
+    let (mut f, compositor) = TestFixture::new_with_compositor();
+    let _pointer = TestObject::<WlPointer>::from_request(
+        &compositor.seat.obj,
+        wl_seat::Request::GetPointer {},
+    );
+    let (_, output) = f.new_output(0, 0);
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&compositor, window);
+    f.testwl
+        .force_decoration_mode(id, zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+    let subsurface_id = f.testwl.last_created_surface_id().unwrap();
+
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+    f.run();
+
+    f.testwl.move_pointer_to(subsurface_id, 50.0, 10.0);
+    f.run();
+    f.testwl.pointer_motion(90.0, 10.0);
+    f.run();
+    let data = f.testwl.get_surface_data(subsurface_id).unwrap();
+    let Some(SurfaceRole::Subsurface(sub)) = &data.role else {
+        panic!("not a subsurface: {:?}", data.role);
+    };
+    assert_eq!(
+        sub.last_commit_sync,
+        Some(false),
+        "hover redraw is independent"
+    );
+    assert!(sub.sync);
+}
+
+#[test]
 fn client_side_decorations_no_global() {
     let mut f = TestFixture::new_pre_connect(|testwl| {
         testwl.disable_decorations_global();
