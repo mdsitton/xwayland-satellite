@@ -306,9 +306,12 @@ impl SurfaceEvents {
                 SurfaceRole::Popup(Some(popup)) => popup.anchor_origin,
                 _ => (0, 0),
             };
-            let x = ((pending.x - anchor_x).max(0) as f64 * scale_factor.0) as i32
+            // The content-relative position may be negative (a popup above the parent's
+            // content, e.g. within the titlebar), and so may the resulting X position; both
+            // are valid.
+            let x = ((pending.x - anchor_x) as f64 * scale_factor.0) as i32
                 + window_data.output_offset.x;
-            let y = ((pending.y - anchor_y).max(0) as f64 * scale_factor.0) as i32
+            let y = ((pending.y - anchor_y) as f64 * scale_factor.0) as i32
                 + window_data.output_offset.y;
             let width = if pending.width > 0 {
                 (pending.width as f64 * scale_factor.0) as u16
