@@ -3656,6 +3656,43 @@ fn popup_reanchored_on_x_resize_and_scale_change() {
 }
 
 #[test]
+fn queued_window_position_follows_output_move() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    f.new_output(0, 0);
+    let (_, output) = f.new_output(500, 100);
+    f.run();
+    let window = Window::new(1);
+    let (_, toplevel_id) = f.create_toplevel(&comp, window);
+    f.testwl.move_surface_to_output(toplevel_id, &output);
+    f.run();
+    let popup = Window::new(2);
+    let (_, p_id) = f.create_popup(
+        &comp,
+        PopupBuilder::new(popup, window, toplevel_id).x(510).y(110),
+    );
+    f.testwl.move_surface_to_output(p_id, &output);
+    f.run();
+    let mut popup_dims = WindowDims {
+        x: 510,
+        y: 110,
+        width: 50,
+        height: 50,
+    };
+    f.assert_window_dimensions(popup, p_id, popup_dims);
+
+    // A configure handled in the same batch as an output move: the position it queues for X
+    // was derived from the old output offset and must move along with the window, instead
+    // of putting the window back once it is applied.
+    f.testwl.configure_popup(p_id);
+    f.testwl.move_output(&output, 600, 200);
+    f.run();
+    f.run();
+    popup_dims.x = 610;
+    popup_dims.y = 210;
+    f.assert_window_dimensions(popup, p_id, popup_dims);
+}
+
+#[test]
 fn client_side_decorations_no_global() {
     let mut f = TestFixture::new_pre_connect(|testwl| {
         testwl.disable_decorations_global();

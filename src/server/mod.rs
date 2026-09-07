@@ -148,10 +148,13 @@ impl WindowData {
         }
     }
 
+    /// Moves the window along with its output. A position queued for X by a configure that
+    /// has not been applied yet was derived from the old offset, and is moved as well.
     fn update_output_offset<C: XConnection>(
         &mut self,
         window: x::Window,
         offset: WindowOutputOffset,
+        pending: Option<&mut PendingSurfaceState>,
         connection: &mut C,
     ) {
         log::trace!(target: "output_offset", "offset: {offset:?}");
@@ -159,9 +162,17 @@ impl WindowData {
             return;
         }
 
+        let (dx, dy) = (
+            offset.x - self.output_offset.x,
+            offset.y - self.output_offset.y,
+        );
         let dims = &mut self.attrs.dims;
-        dims.x += (offset.x - self.output_offset.x) as i16;
-        dims.y += (offset.y - self.output_offset.y) as i16;
+        dims.x += dx as i16;
+        dims.y += dy as i16;
+        if let Some(pending) = pending {
+            pending.x += dx;
+            pending.y += dy;
+        }
         self.output_offset = offset;
 
         if connection.set_window_dims(

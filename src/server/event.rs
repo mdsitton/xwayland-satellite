@@ -211,8 +211,12 @@ impl SurfaceEvents {
 
                 debug!("{} entered {}", surface.id(), output.id());
 
-                let mut query = data.query::<(&x::Window, &mut WindowData)>();
-                if let Some((window, win_data)) = query.get() {
+                let mut query = data.query::<(
+                    &x::Window,
+                    &mut WindowData,
+                    Option<&mut PendingSurfaceState>,
+                )>();
+                if let Some((window, win_data, pending)) = query.get() {
                     let Some(dimensions) = output_data.get::<&OutputDimensions>() else {
                         return;
                     };
@@ -222,6 +226,7 @@ impl SurfaceEvents {
                             x: dimensions.x - state.global_output_offset.x.value,
                             y: dimensions.y - state.global_output_offset.y.value,
                         },
+                        pending,
                         connection,
                     );
                     if state.last_focused_toplevel == Some(*window) {
@@ -1187,11 +1192,16 @@ fn update_window_output_offsets(
     let Ok(dimensions) = world.get::<&OutputDimensions>(output) else {
         return;
     };
-    let mut query = world.query::<(&x::Window, &mut WindowData, &OnOutput)>();
+    let mut query = world.query::<(
+        &x::Window,
+        &mut WindowData,
+        &OnOutput,
+        Option<&mut PendingSurfaceState>,
+    )>();
 
-    for (_, (window, data, _)) in query
+    for (_, (window, data, _, pending)) in query
         .into_iter()
-        .filter(|(_, (_, _, on_output))| on_output.0 == output)
+        .filter(|(_, (_, _, on_output, _))| on_output.0 == output)
     {
         data.update_output_offset(
             *window,
@@ -1199,6 +1209,7 @@ fn update_window_output_offsets(
                 x: dimensions.x - global_output_offset.x.value,
                 y: dimensions.y - global_output_offset.y.value,
             },
+            pending,
             connection,
         );
     }
