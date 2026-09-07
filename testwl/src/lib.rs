@@ -266,6 +266,8 @@ struct State {
     /// state each request was made with.
     hold_reposition_replies: bool,
     held_repositions: std::collections::VecDeque<(SurfaceId, u32, PositionerState)>,
+    /// The configure of a reply whose repositioned event was sent on its own.
+    staged_configure: Option<(SurfaceId, PositionerState)>,
     buffers: HashMap<WlBuffer, Vec2>,
     begin: Instant,
     last_surface_id: Option<SurfaceId>,
@@ -302,6 +304,7 @@ impl Default for State {
             positioners: Default::default(),
             hold_reposition_replies: false,
             held_repositions: Default::default(),
+            staged_configure: None,
             begin: Instant::now(),
             last_surface_id: None,
             last_output: None,
@@ -385,6 +388,13 @@ impl State {
 
     #[track_caller]
     fn configure_popup(&mut self, surface_id: SurfaceId) {
+        self.configure_popup_slid(surface_id, 0, 0);
+    }
+
+    /// Configures the popup at the requested position slid by the given amount, as a
+    /// compositor constraining it would.
+    #[track_caller]
+    fn configure_popup_slid(&mut self, surface_id: SurfaceId, dx: i32, dy: i32) {
         let surface = self.surfaces.get_mut(&surface_id).unwrap();
         let Some(SurfaceRole::Popup(p)) = &mut surface.role else {
             panic!("Surface does not have popup role: {:?}", surface.role);
@@ -399,8 +409,12 @@ impl State {
         // The popup's position is relative to the parent's window geometry, which is where the
         // anchor rect is placed.
         let anchor = anchor_rect.as_ref().map(|r| r.offset).unwrap_or_default();
-        p.popup
-            .configure(anchor.x + offset.x, anchor.y + offset.y, size.x, size.y);
+        p.popup.configure(
+            anchor.x + offset.x + dx,
+            anchor.y + offset.y + dy,
+            size.x,
+            size.y,
+        );
         p.xdg.configure(self.configure_serial);
         self.configure_serial += 1;
     }
@@ -660,6 +674,13 @@ impl Server {
         self.display.flush_clients().unwrap();
     }
 
+    /// Configures the popup at its requested position slid by the given amount, as a
+    /// compositor constraining it would.
+    pub fn configure_popup_slid(&mut self, surface_id: SurfaceId, dx: i32, dy: i32) {
+        self.state.configure_popup_slid(surface_id, dx, dy);
+        self.display.flush_clients().unwrap();
+    }
+
     /// Holds back replies to xdg_popup.reposition until `release_reposition_reply`.
     pub fn hold_reposition_replies(&mut self, hold: bool) {
         self.state.hold_reposition_replies = hold;
@@ -668,9 +689,48 @@ impl Server {
     /// Replies to the oldest held reposition with the positioner state it was requested
     /// with. Returns false if none is held.
     pub fn release_reposition_reply(&mut self) -> bool {
+        if !self.release_repositioned_only() {
+            return false;
+        }
+        self.release_staged_configure();
+        true
+    }
+
+    /// Drops the oldest held reposition without answering it, as a compositor that only
+    /// answers the latest of several does. Returns false if none is held.
+    pub fn skip_reposition_reply(&mut self) -> bool {
+        self.state.held_repositions.pop_front().is_some()
+    }
+
+    /// Sends only the repositioned event of the oldest held reposition's reply; the configure
+    /// that completes the reply follows with `release_staged_configure`. Returns false if
+    /// none is held.
+    pub fn release_repositioned_only(&mut self) -> bool {
+        assert!(
+            self.state.staged_configure.is_none(),
+            "a staged configure is pending"
+        );
         let Some((surface_id, token, positioner)) = self.state.held_repositions.pop_front() else {
             return false;
         };
+        let surface = self.state.surfaces.get_mut(&surface_id).unwrap();
+        let Some(SurfaceRole::Popup(p)) = &mut surface.role else {
+            panic!("Surface does not have popup role: {:?}", surface.role);
+        };
+        p.popup.repositioned(token);
+        self.state.staged_configure = Some((surface_id, positioner));
+        self.display.flush_clients().unwrap();
+        true
+    }
+
+    /// Sends the configure completing the reply whose repositioned event was sent with
+    /// `release_repositioned_only`.
+    pub fn release_staged_configure(&mut self) {
+        let (surface_id, positioner) = self
+            .state
+            .staged_configure
+            .take()
+            .expect("no staged configure");
         let surface = self.state.surfaces.get_mut(&surface_id).unwrap();
         let Some(SurfaceRole::Popup(p)) = &mut surface.role else {
             panic!("Surface does not have popup role: {:?}", surface.role);
@@ -681,7 +741,6 @@ impl Server {
             .as_ref()
             .map(|r| r.offset)
             .unwrap_or_default();
-        p.popup.repositioned(token);
         p.popup.configure(
             anchor.x + positioner.offset.x,
             anchor.y + positioner.offset.y,
@@ -691,7 +750,6 @@ impl Server {
         p.xdg.configure(self.state.configure_serial);
         self.state.configure_serial += 1;
         self.display.flush_clients().unwrap();
-        true
     }
 
     #[track_caller]
