@@ -110,6 +110,8 @@ pub struct SurfaceData {
     pub surface: WlSurface,
     pub buffer: Option<WlBuffer>,
     pub last_damage: Option<BufferDamage>,
+    /// Number of damage requests seen.
+    pub damage_requests: u32,
     pub role: Option<SurfaceRole>,
     pub last_enter_serial: Option<u32>,
     pub fractional: Option<WpFractionalScaleV1>,
@@ -2112,6 +2114,7 @@ impl Dispatch<WlCompositor, ()> for State {
                         surface,
                         buffer: None,
                         last_damage: None,
+                        damage_requests: 0,
                         role: None,
                         last_enter_serial: None,
                         fractional: None,
@@ -2194,6 +2197,7 @@ impl Dispatch<WlSurface, ()> for State {
                 width,
                 height,
             } => {
+                data.damage_requests += 1;
                 data.last_damage = Some(BufferDamage {
                     x,
                     y,
