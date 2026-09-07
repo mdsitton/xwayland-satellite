@@ -298,6 +298,36 @@ impl SurfaceEvents {
         drop(xdg);
 
         if let Some(pending) = pending {
+            // A popup's configure is interpreted with the request it answers. Its position is
+            // relative to the parent's window geometry, in the parent's logical coordinates;
+            // its size is in the popup's own. A configure that echoes the request restores the
+            // X geometry the request was derived from exactly, rather than converting back
+            // through rounding; a changed one (the compositor constrained it) is converted.
+            let popup = match &*data.get::<&SurfaceRole>().unwrap() {
+                SurfaceRole::Popup(Some(popup)) => Some((popup.configure_request, popup.parent)),
+                _ => None,
+            };
+            let popup = popup.map(|(request, parent)| {
+                let parent = state.world.entity(parent).ok();
+                // The parent's position relative to its output.
+                let parent_origin = parent
+                    .as_ref()
+                    .and_then(|p| {
+                        p.get::<&WindowData>().map(|w| {
+                            (
+                                i32::from(w.attrs.dims.x) - w.output_offset.x,
+                                i32::from(w.attrs.dims.y) - w.output_offset.y,
+                            )
+                        })
+                    })
+                    .unwrap_or((0, 0));
+                let parent_scale = parent
+                    .as_ref()
+                    .and_then(|p| p.get::<&SurfaceScaleFactor>().map(|s| s.0))
+                    .unwrap_or_else(|| data.get::<&SurfaceScaleFactor>().unwrap().0);
+                (request, parent_origin, parent_scale)
+            });
+
             let mut query = data.query::<(
                 &SurfaceScaleFactor,
                 &x::Window,
@@ -307,25 +337,55 @@ impl SurfaceEvents {
             let (scale_factor, window, window_data, role) = query.get().unwrap();
 
             let window = *window;
-            // Popup positions are relative to the parent's window geometry; make them relative
-            // to the parent's X window (see PopupData::anchor_origin).
-            let (anchor_x, anchor_y) = match role {
-                SurfaceRole::Popup(Some(popup)) => popup.configure_anchor,
-                _ => (0, 0),
+            let (x, y) = match popup {
+                Some((request, parent_origin, parent_scale)) => {
+                    // Each axis on its own: one granted as requested restores the X offset it
+                    // was derived from, a constrained one is converted. The position is
+                    // relative to the parent, which is relative to its output, and includes
+                    // the popup's own output offset like every window position. The
+                    // content-relative position may be negative (a popup above the parent's
+                    // content, e.g. within the titlebar), and so may the resulting X position;
+                    // both are valid.
+                    let axis = |pending: i32, anchor: i32, offset: i32, x_offset: i32| {
+                        if pending == anchor + offset {
+                            x_offset
+                        } else {
+                            ((pending - anchor) as f64 * parent_scale) as i32
+                        }
+                    };
+                    let anchor = request.anchor_origin;
+                    (
+                        parent_origin.0
+                            + axis(pending.x, anchor.0, request.offset.0, request.x_offset.0)
+                            + window_data.output_offset.x,
+                        parent_origin.1
+                            + axis(pending.y, anchor.1, request.offset.1, request.x_offset.1)
+                            + window_data.output_offset.y,
+                    )
+                }
+                None => (
+                    (pending.x.max(0) as f64 * scale_factor.0) as i32 + window_data.output_offset.x,
+                    (pending.y.max(0) as f64 * scale_factor.0) as i32 + window_data.output_offset.y,
+                ),
             };
-            // The content-relative position may be negative (a popup above the parent's
-            // content, e.g. within the titlebar), and so may the resulting X position; both
-            // are valid.
-            let x = ((pending.x - anchor_x) as f64 * scale_factor.0) as i32
-                + window_data.output_offset.x;
-            let y = ((pending.y - anchor_y) as f64 * scale_factor.0) as i32
-                + window_data.output_offset.y;
-            let width = if pending.width > 0 {
+            let (echoed_width, echoed_height) = popup
+                .map(|(request, _, _)| {
+                    (
+                        (pending.width == request.size.0).then_some(request.x_size.0),
+                        (pending.height == request.size.1).then_some(request.x_size.1),
+                    )
+                })
+                .unwrap_or((None, None));
+            let width = if let Some(width) = echoed_width {
+                width
+            } else if pending.width > 0 {
                 (pending.width as f64 * scale_factor.0) as u16
             } else {
                 window_data.attrs.dims.width
             };
-            let height = if pending.height > 0 {
+            let height = if let Some(height) = echoed_height {
+                height
+            } else if pending.height > 0 {
                 let mut logical_height = pending.height;
                 // The titlebar drawn by satellite is part of the configured toplevel size, so
                 // the X window only gets the remaining height. The viewport must then match the
@@ -368,6 +428,14 @@ impl SurfaceEvents {
             };
             let is_toplevel = matches!(role, SurfaceRole::Toplevel(Some(_)));
             drop(query);
+            if let Some(SurfaceRole::Popup(Some(popup))) = state
+                .world
+                .get::<&mut SurfaceRole>(target)
+                .ok()
+                .as_deref_mut()
+            {
+                popup.configured();
+            }
             state.world.insert_one(target, pending).unwrap();
             update_surface_viewport(&state.world, state.world.query_one(target).unwrap());
             if is_toplevel {
@@ -375,19 +443,22 @@ impl SurfaceEvents {
             }
         }
 
-        let (surface, attach, callback) = state
+        let (surface, role, attach, callback) = state
             .world
             .query_one_mut::<(
                 &client::wl_surface::WlSurface,
+                &mut SurfaceRole,
                 Option<&SurfaceAttach>,
                 Option<&WlCallback>,
             )>(target)
             .unwrap();
+        let xdg = role.xdg_mut().unwrap();
 
         let mut cmd = CommandBuffer::new();
 
         if let Some(SurfaceAttach { buffer, x, y }) = attach {
             surface.attach(buffer.as_ref(), *x, *y);
+            xdg.pending_buffer = Some(buffer.is_some());
             cmd.remove_one::<SurfaceAttach>(target);
         }
         if let Some(cb) = callback {
@@ -395,6 +466,12 @@ impl SurfaceEvents {
             cmd.remove_one::<client::wl_callback::WlCallback>(target);
         }
         surface.commit();
+        if xdg.committed() && matches!(role, SurfaceRole::Popup(_)) {
+            // A popup is not re-anchored before it is mapped. Whatever changed since its
+            // initial positioner was built (its scale, the parent's geometry) is caught up
+            // on now.
+            state.pending_popup_refresh.push(target);
+        }
         cmd.run_on(&mut state.world);
     }
 

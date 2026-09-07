@@ -3693,6 +3693,813 @@ fn queued_window_position_follows_output_move() {
 }
 
 #[test]
+fn popup_keeps_its_x_geometry_across_reanchors_at_fractional_scale() {
+    // At a fractional scale the popup's X geometry has no exact logical equivalent. A
+    // configure that grants what was requested must restore the X geometry the request was
+    // derived from, or every re-anchor rounds the popup down a little further.
+    let mut f = TestFixture::new_pre_connect(|testwl| {
+        testwl.enable_fractional_scale();
+    });
+    let comp = f.compositor();
+    let (_, output) = f.new_output(0, 0);
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, window);
+    f.testwl
+        .get_surface_data(id)
+        .unwrap()
+        .fractional
+        .as_ref()
+        .expect("Missing fractional scale data")
+        .preferred_scale(156); // 1.3
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+    f.run();
+
+    let popup = Window::new(2);
+    let (_, p_id) = f.create_popup(
+        &comp,
+        PopupBuilder::new(popup, window, id)
+            .x(20)
+            .y(20)
+            .check_size_and_pos(false),
+    );
+    f.testwl.move_surface_to_output(p_id, &output);
+    f.run();
+    let expected = WindowDims {
+        x: 20,
+        y: 20,
+        width: 50,
+        height: 50,
+    };
+    assert_eq!(f.connection().window(popup).dims, expected);
+
+    // Each parent resize re-anchors the popup.
+    for width in [110, 100, 110, 100] {
+        f.testwl.configure_toplevel(id, width, 100, vec![]);
+        f.run();
+        f.run();
+        assert_eq!(f.connection().window(popup).dims, expected);
+    }
+}
+
+#[test]
+fn popup_keeps_odd_x_size_across_scale_change() {
+    let (mut f, compositor) = TestFixture::new_with_compositor();
+    let (_, output) = f.new_output(0, 0);
+    f.run();
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&compositor, window);
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+    let popup = Window::new(2);
+    let (_, p_id) = f.create_popup(
+        &compositor,
+        PopupBuilder::new(popup, window, id)
+            .x(20)
+            .y(20)
+            .width(51)
+            .height(51)
+            .check_size_and_pos(false),
+    );
+    f.testwl.move_surface_to_output(p_id, &output);
+    f.run();
+    let expected = WindowDims {
+        x: 20,
+        y: 20,
+        width: 51,
+        height: 51,
+    };
+    assert_eq!(f.connection().window(popup).dims, expected);
+
+    // 51 X pixels are 25.5 logical pixels at scale 2; the popup is requested at 25 and must
+    // stay 51 wide when that is granted.
+    output.scale(2);
+    output.done();
+    f.run();
+    f.run();
+    assert_eq!(f.connection().window(popup).dims, expected);
+    assert_eq!(
+        f.testwl
+            .get_surface_data(p_id)
+            .unwrap()
+            .popup()
+            .positioner_state
+            .size,
+        Some(testwl::Vec2 { x: 25, y: 25 })
+    );
+
+    output.scale(1);
+    output.done();
+    f.run();
+    f.run();
+    assert_eq!(f.connection().window(popup).dims, expected);
+}
+
+#[test]
+fn popup_only_scale_change_keeps_its_position() {
+    // A popup's position is relative to its parent, in the parent's scale; only its size is
+    // in its own. When the popup's scale changes but the parent's does not, its position
+    // must be converted with the parent's scale on the way back as well.
+    let mut f = TestFixture::new_pre_connect(|testwl| {
+        testwl.enable_fractional_scale();
+    });
+    let comp = f.compositor();
+    let (_, output) = f.new_output(0, 0);
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, window);
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+    let popup = Window::new(2);
+    let (_, p_id) = f.create_popup(
+        &comp,
+        PopupBuilder::new(popup, window, id)
+            .x(20)
+            .y(20)
+            .check_size_and_pos(false),
+    );
+    f.testwl.move_surface_to_output(p_id, &output);
+    f.run();
+    let expected = WindowDims {
+        x: 20,
+        y: 20,
+        width: 50,
+        height: 50,
+    };
+    assert_eq!(f.connection().window(popup).dims, expected);
+
+    f.testwl
+        .get_surface_data(p_id)
+        .unwrap()
+        .fractional
+        .as_ref()
+        .expect("Missing fractional scale data")
+        .preferred_scale(240); // 2.0
+    f.run();
+    f.run();
+    f.run();
+    let data = f.testwl.get_surface_data(p_id).unwrap();
+    let pos = &data.popup().positioner_state;
+    assert_eq!(pos.offset, testwl::Vec2 { x: 20, y: 20 });
+    assert_eq!(pos.size, Some(testwl::Vec2 { x: 25, y: 25 }));
+    assert_eq!(f.connection().window(popup).dims, expected);
+}
+
+#[test]
+fn popup_on_another_output_keeps_its_position_when_reanchored() {
+    // Window positions are relative to the window's own output. A popup that entered a
+    // different output than its parent must be re-anchored, and its granted position
+    // restored, relative to those outputs, or it moves by the outputs' distance each time.
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    f.new_output(0, 0);
+    let (_, parent_output) = f.new_output(500, 100);
+    let (_, popup_output) = f.new_output(1000, 100);
+    f.run();
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, window);
+    f.testwl.move_surface_to_output(id, &parent_output);
+    f.run();
+    let popup = Window::new(2);
+    let (_, p_id) = f.create_popup(&comp, PopupBuilder::new(popup, window, id).x(1010).y(110));
+    f.testwl.move_surface_to_output(p_id, &popup_output);
+    f.run();
+    f.run();
+    let dims = f.connection().window(popup).dims;
+    let offset = f
+        .testwl
+        .get_surface_data(p_id)
+        .unwrap()
+        .popup()
+        .positioner_state
+        .offset;
+    assert_eq!(offset, testwl::Vec2 { x: 510, y: 10 });
+
+    f.testwl.configure_toplevel(id, 110, 100, vec![]);
+    f.run();
+    f.run();
+    assert_eq!(f.connection().window(popup).dims, dims);
+    let data = f.testwl.get_surface_data(p_id).unwrap();
+    assert_eq!(data.popup().positioner_state.offset, offset);
+}
+
+#[test]
+fn popup_constrained_on_one_axis_keeps_the_other() {
+    // The compositor may slide a popup along one axis only. The other axis was granted as
+    // requested and keeps its exact X position, instead of being converted back through
+    // rounding along with the constrained one.
+    let mut f = TestFixture::new_pre_connect(|testwl| {
+        testwl.enable_fractional_scale();
+    });
+    let comp = f.compositor();
+    let (_, output) = f.new_output(0, 0);
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, window);
+    f.testwl
+        .get_surface_data(id)
+        .unwrap()
+        .fractional
+        .as_ref()
+        .expect("Missing fractional scale data")
+        .preferred_scale(156); // 1.3
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+    f.run();
+    let popup = Window::new(2);
+    let (_, p_id) = f.create_popup(
+        &comp,
+        PopupBuilder::new(popup, window, id)
+            .x(20)
+            .y(20)
+            .check_size_and_pos(false),
+    );
+    f.testwl.move_surface_to_output(p_id, &output);
+    f.run();
+    let dims = |x, y| WindowDims {
+        x,
+        y,
+        width: 50,
+        height: 50,
+    };
+    assert_eq!(f.connection().window(popup).dims, dims(20, 20));
+
+    // Requested at 15 logical pixels (20 / 1.3); slid up by one, the y position is
+    // converted back (14 * 1.3), the x position is kept.
+    f.testwl.configure_popup_slid(p_id, 0, -1);
+    f.run();
+    assert_eq!(f.connection().window(popup).dims, dims(20, 18));
+
+    f.testwl.configure_popup_slid(p_id, -1, 0);
+    f.run();
+    assert_eq!(f.connection().window(popup).dims, dims(18, 20));
+}
+
+#[test]
+fn popup_refreshed_after_its_first_configure() {
+    // A popup is not re-anchored before its first configure, since it is positioned by its
+    // initial positioner until then. A change that would have re-anchored it in the meantime
+    // (here its scale) must not be lost: it is refreshed once configured.
+    let mut f = TestFixture::new_pre_connect(|testwl| {
+        testwl.enable_fractional_scale();
+    });
+    let comp = f.compositor();
+    let (_, output) = f.new_output(0, 0);
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, window);
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+
+    // As create_popup does, without the first configure.
+    let popup = Window::new(2);
+    let (buffer, surface) = comp.create_surface();
+    let dims = WindowDims {
+        x: 20,
+        y: 20,
+        width: 50,
+        height: 50,
+    };
+    f.new_window(
+        popup,
+        true,
+        WindowData {
+            mapped: true,
+            dims,
+            fullscreen: false,
+        },
+    );
+    f.map_window(&comp, popup, &surface.obj, &buffer);
+    f.run();
+    let p_id = f.check_new_surface();
+    assert_ne!(p_id, id);
+    f.testwl
+        .get_surface_data(p_id)
+        .unwrap()
+        .fractional
+        .as_ref()
+        .expect("Missing fractional scale data")
+        .preferred_scale(240); // 2.0
+    // The refresh this queues finds the popup not configured yet.
+    f.run();
+    f.run();
+    assert_eq!(
+        f.testwl
+            .get_surface_data(p_id)
+            .unwrap()
+            .popup()
+            .positioner_state
+            .size,
+        Some(testwl::Vec2 { x: 50, y: 50 })
+    );
+
+    f.testwl.configure_popup(p_id);
+    f.run();
+    f.run();
+    f.run();
+    assert_eq!(f.connection().window(popup).dims, dims);
+    let data = f.testwl.get_surface_data(p_id).unwrap();
+    assert_eq!(
+        data.popup().positioner_state.size,
+        Some(testwl::Vec2 { x: 25, y: 25 })
+    );
+    let viewport = data.viewport.as_ref().expect("Missing viewport");
+    assert_eq!((viewport.width, viewport.height), (25, 25));
+}
+
+#[test]
+fn popup_refreshed_once_its_first_buffer_is_committed() {
+    // A popup is only mapped once a buffer is committed to its surface, and can only be
+    // repositioned then. If its first configure arrives before its first buffer, the catch-up
+    // refresh waits for that buffer's commit.
+    let mut f = TestFixture::new_pre_connect(|testwl| {
+        testwl.enable_fractional_scale();
+    });
+    let comp = f.compositor();
+    let (_, output) = f.new_output(0, 0);
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, window);
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+
+    // As map_window does, without attaching a buffer.
+    let popup = Window::new(2);
+    let (buffer, surface) = comp.create_surface();
+    let dims = WindowDims {
+        x: 20,
+        y: 20,
+        width: 50,
+        height: 50,
+    };
+    f.new_window(
+        popup,
+        true,
+        WindowData {
+            mapped: true,
+            dims,
+            fullscreen: false,
+        },
+    );
+    f.satellite.map_window(popup);
+    f.associate_window(&comp, popup, &surface.obj);
+    f.run();
+    let p_id = f.check_new_surface();
+    assert_ne!(p_id, id);
+    f.testwl
+        .get_surface_data(p_id)
+        .unwrap()
+        .fractional
+        .as_ref()
+        .expect("Missing fractional scale data")
+        .preferred_scale(240); // 2.0
+    f.run();
+    f.run();
+    let positioner_size = |f: &TestFixture<FakeXConnection>| {
+        f.testwl
+            .get_surface_data(p_id)
+            .unwrap()
+            .popup()
+            .positioner_state
+            .size
+    };
+    assert_eq!(positioner_size(&f), Some(testwl::Vec2 { x: 50, y: 50 }));
+
+    // Configured, but with no buffer committed the popup is not mapped: no reposition yet.
+    f.testwl.configure_popup(p_id);
+    f.run();
+    f.run();
+    f.run();
+    assert_eq!(positioner_size(&f), Some(testwl::Vec2 { x: 50, y: 50 }));
+    assert!(f.testwl.get_surface_data(p_id).unwrap().buffer.is_none());
+
+    // Nor does a resize by the X client reposition it before it is mapped...
+    let dims = WindowDims { width: 60, ..dims };
+    f.reconfigure_window(popup, dims, true);
+    f.run();
+    f.run();
+    assert_eq!(positioner_size(&f), Some(testwl::Vec2 { x: 50, y: 50 }));
+
+    // ...and a buffer attached but not committed does not map it.
+    surface
+        .send_request(Req::<WlSurface>::Attach {
+            buffer: Some(buffer.obj.clone()),
+            x: 0,
+            y: 0,
+        })
+        .unwrap();
+    f.run();
+    f.run();
+    assert_eq!(positioner_size(&f), Some(testwl::Vec2 { x: 50, y: 50 }));
+
+    // The commit maps it; the popup is then repositioned to its current X size at its
+    // current scale.
+    surface.send_request(Req::<WlSurface>::Commit).unwrap();
+    f.run();
+    f.run();
+    f.run();
+    assert!(f.testwl.get_surface_data(p_id).unwrap().buffer.is_some());
+    assert_eq!(f.connection().window(popup).dims, dims);
+    let data = f.testwl.get_surface_data(p_id).unwrap();
+    assert_eq!(
+        data.popup().positioner_state.size,
+        Some(testwl::Vec2 { x: 30, y: 25 })
+    );
+    let viewport = data.viewport.as_ref().expect("Missing viewport");
+    assert_eq!((viewport.width, viewport.height), (30, 25));
+}
+
+#[test]
+fn popup_resized_by_x_before_its_first_configure_is_repositioned_once_mapped() {
+    // The X client resizes the popup before its first configure. That configure grants the
+    // initial size and is applied to the X window as any configure is, but the client's size
+    // is what the popup is repositioned to once mapped, not the size that configure applied.
+    for (preferred_scale, expected_size) in [(None, (60, 50)), (Some(240), (30, 25))] {
+        let mut f = TestFixture::new_pre_connect(|testwl| {
+            testwl.enable_fractional_scale();
+        });
+        let comp = f.compositor();
+        let (_, output) = f.new_output(0, 0);
+        let window = Window::new(1);
+        let (_, id) = f.create_toplevel(&comp, window);
+        f.testwl.move_surface_to_output(id, &output);
+        f.run();
+
+        let popup = Window::new(2);
+        let (buffer, surface) = comp.create_surface();
+        let dims = WindowDims {
+            x: 20,
+            y: 20,
+            width: 50,
+            height: 50,
+        };
+        f.new_window(
+            popup,
+            true,
+            WindowData {
+                mapped: true,
+                dims,
+                fullscreen: false,
+            },
+        );
+        f.satellite.map_window(popup);
+        f.associate_window(&comp, popup, &surface.obj);
+        f.run();
+        let p_id = f.check_new_surface();
+        assert_ne!(p_id, id);
+        if let Some(preferred_scale) = preferred_scale {
+            f.testwl
+                .get_surface_data(p_id)
+                .unwrap()
+                .fractional
+                .as_ref()
+                .expect("Missing fractional scale data")
+                .preferred_scale(preferred_scale);
+            f.run();
+            f.run();
+        }
+        let positioner_size = |f: &TestFixture<FakeXConnection>| {
+            f.testwl
+                .get_surface_data(p_id)
+                .unwrap()
+                .popup()
+                .positioner_state
+                .size
+        };
+
+        let dims = WindowDims { width: 60, ..dims };
+        f.reconfigure_window(popup, dims, true);
+        f.run();
+        f.run();
+        assert_eq!(positioner_size(&f), Some(testwl::Vec2 { x: 50, y: 50 }));
+
+        f.testwl.configure_popup(p_id);
+        f.run();
+        f.run();
+        f.run();
+        assert_eq!(positioner_size(&f), Some(testwl::Vec2 { x: 50, y: 50 }));
+
+        surface
+            .send_request(Req::<WlSurface>::Attach {
+                buffer: Some(buffer.obj.clone()),
+                x: 0,
+                y: 0,
+            })
+            .unwrap();
+        surface.send_request(Req::<WlSurface>::Commit).unwrap();
+        f.run();
+        f.run();
+        f.run();
+        assert_eq!(
+            f.connection().window(popup).dims,
+            dims,
+            "X size at scale {preferred_scale:?}"
+        );
+        let data = f.testwl.get_surface_data(p_id).unwrap();
+        let expected = testwl::Vec2 {
+            x: expected_size.0,
+            y: expected_size.1,
+        };
+        assert_eq!(data.popup().positioner_state.size, Some(expected));
+        let viewport = data.viewport.as_ref().expect("Missing viewport");
+        assert_eq!((viewport.width, viewport.height), expected_size);
+    }
+}
+
+#[test]
+fn popup_x_resize_survives_a_parent_refresh_while_its_reposition_is_in_flight() {
+    // The reposition carrying the client's size is not answered yet when the parent is
+    // resized. The refresh that re-anchors the popup must keep asking for the client's size,
+    // not fall back to the X window's, which the initial configure set to the initial size.
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let (_, output) = f.new_output(0, 0);
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, window);
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+
+    let popup = Window::new(2);
+    let (buffer, surface) = comp.create_surface();
+    let dims = WindowDims {
+        x: 20,
+        y: 20,
+        width: 50,
+        height: 50,
+    };
+    f.new_window(
+        popup,
+        true,
+        WindowData {
+            mapped: true,
+            dims,
+            fullscreen: false,
+        },
+    );
+    f.satellite.map_window(popup);
+    f.associate_window(&comp, popup, &surface.obj);
+    f.run();
+    let p_id = f.check_new_surface();
+    assert_ne!(p_id, id);
+
+    let dims = WindowDims { width: 60, ..dims };
+    f.reconfigure_window(popup, dims, true);
+    f.run();
+    f.testwl.configure_popup(p_id);
+    f.run();
+    f.run();
+
+    // Mapping sends the reposition for the client's size; its reply is held back.
+    f.testwl.hold_reposition_replies(true);
+    surface
+        .send_request(Req::<WlSurface>::Attach {
+            buffer: Some(buffer.obj.clone()),
+            x: 0,
+            y: 0,
+        })
+        .unwrap();
+    surface.send_request(Req::<WlSurface>::Commit).unwrap();
+    f.run();
+    f.run();
+    let state = |f: &TestFixture<FakeXConnection>| {
+        let data = f.testwl.get_surface_data(p_id).unwrap();
+        let pos = &data.popup().positioner_state;
+        (pos.anchor_rect.as_ref().unwrap().size, pos.size.unwrap())
+    };
+    let v = |x, y| testwl::Vec2 { x, y };
+    assert_eq!(state(&f), (v(100, 100), v(60, 50)));
+
+    // The parent's resize re-anchors the popup while that reply is outstanding.
+    f.testwl.configure_toplevel(id, 110, 100, vec![]);
+    f.run();
+    f.run();
+    assert_eq!(state(&f), (v(110, 100), v(60, 50)));
+
+    while f.testwl.release_reposition_reply() {
+        f.run();
+        f.run();
+    }
+    assert_eq!(f.connection().window(popup).dims, dims);
+    assert_eq!(state(&f), (v(110, 100), v(60, 50)));
+}
+
+#[test]
+fn popup_x_resize_survives_a_parent_refresh_between_repositioned_and_its_configure() {
+    // The reply to the reposition carrying the client's size arrives in two batches: its
+    // repositioned event first, the configure applying it later. A parent refresh in between
+    // must still ask for the client's size, which the X window does not have yet.
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let (_, output) = f.new_output(0, 0);
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, window);
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+
+    let popup = Window::new(2);
+    let (buffer, surface) = comp.create_surface();
+    let dims = WindowDims {
+        x: 20,
+        y: 20,
+        width: 50,
+        height: 50,
+    };
+    f.new_window(
+        popup,
+        true,
+        WindowData {
+            mapped: true,
+            dims,
+            fullscreen: false,
+        },
+    );
+    f.satellite.map_window(popup);
+    f.associate_window(&comp, popup, &surface.obj);
+    f.run();
+    let p_id = f.check_new_surface();
+    let dims = WindowDims { width: 60, ..dims };
+    f.reconfigure_window(popup, dims, true);
+    f.run();
+    f.testwl.configure_popup(p_id);
+    f.run();
+    f.run();
+    f.testwl.hold_reposition_replies(true);
+    surface
+        .send_request(Req::<WlSurface>::Attach {
+            buffer: Some(buffer.obj.clone()),
+            x: 0,
+            y: 0,
+        })
+        .unwrap();
+    surface.send_request(Req::<WlSurface>::Commit).unwrap();
+    f.run();
+    f.run();
+    let state = |f: &TestFixture<FakeXConnection>| {
+        let data = f.testwl.get_surface_data(p_id).unwrap();
+        let pos = &data.popup().positioner_state;
+        (pos.anchor_rect.as_ref().unwrap().size, pos.size.unwrap())
+    };
+    let v = |x, y| testwl::Vec2 { x, y };
+    assert_eq!(state(&f), (v(100, 100), v(60, 50)));
+
+    // Only the repositioned event of the reply, then an X-side parent resize.
+    assert!(f.testwl.release_repositioned_only());
+    f.run();
+    f.reconfigure_window(
+        window,
+        WindowDims {
+            x: 0,
+            y: 0,
+            width: 110,
+            height: 100,
+        },
+        false,
+    );
+    f.run();
+    f.run();
+    assert_eq!(state(&f), (v(110, 100), v(60, 50)));
+
+    f.testwl.release_staged_configure();
+    f.run();
+    f.run();
+    while f.testwl.release_reposition_reply() {
+        f.run();
+        f.run();
+    }
+    assert_eq!(f.connection().window(popup).dims, dims);
+    assert_eq!(state(&f), (v(110, 100), v(60, 50)));
+}
+
+#[test]
+fn popup_client_geometry_retired_by_queue_order_across_token_wrap() {
+    // Reposition tokens wrap; which request answers the client's geometry is decided by the
+    // order the requests were made in, not by comparing token values.
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let (_, output) = f.new_output(0, 0);
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, window);
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+    let popup = Window::new(2);
+    let (_, p_id) = f.create_popup(&comp, PopupBuilder::new(popup, window, id).x(20).y(20));
+    f.testwl.move_surface_to_output(p_id, &output);
+    f.run();
+    let entity = f.satellite.windows[&popup];
+    fn popup_data(
+        f: &TestFixture<FakeXConnection>,
+        entity: hecs::Entity,
+    ) -> hecs::RefMut<'_, super::PopupData> {
+        let role = f
+            .satellite
+            .world
+            .get::<&mut super::SurfaceRole>(entity)
+            .unwrap();
+        hecs::RefMut::map(role, |role| {
+            let super::SurfaceRole::Popup(Some(data)) = role else {
+                panic!("not a popup");
+            };
+            data
+        })
+    }
+    popup_data(&f, entity).next_reposition_token = u32::MAX;
+    f.testwl.hold_reposition_replies(true);
+    let mut dims = f.connection().window(popup).dims;
+
+    // The client's size goes out with token u32::MAX, a parent resize with token 0. The
+    // compositor answers only the later request, which answers the client's size as well.
+    dims.width = 60;
+    f.reconfigure_window(popup, dims, true);
+    f.run();
+    assert_eq!(
+        popup_data(&f, entity)
+            .client_geometry
+            .and_then(|g| g.sent_with),
+        Some(u32::MAX)
+    );
+    f.testwl.configure_toplevel(id, 110, 100, vec![]);
+    f.run();
+    f.run();
+    assert!(f.testwl.skip_reposition_reply());
+    assert!(f.testwl.release_reposition_reply());
+    f.run();
+    f.run();
+    assert!(popup_data(&f, entity).client_geometry.is_none());
+    assert_eq!(f.connection().window(popup).dims, dims);
+
+    // Wrap again: a parent resize goes out with token u32::MAX, then the client's size with
+    // token 0. The parent's reply comes first and must not retire the client's geometry.
+    popup_data(&f, entity).next_reposition_token = u32::MAX;
+    f.testwl.configure_toplevel(id, 120, 100, vec![]);
+    f.run();
+    f.run();
+    dims.width = 70;
+    f.reconfigure_window(popup, dims, true);
+    f.run();
+    assert_eq!(
+        popup_data(&f, entity)
+            .client_geometry
+            .and_then(|g| g.sent_with),
+        Some(0)
+    );
+    assert!(f.testwl.release_reposition_reply());
+    f.run();
+    f.run();
+    assert!(popup_data(&f, entity).client_geometry.is_some());
+    assert!(f.testwl.release_reposition_reply());
+    f.run();
+    f.run();
+    assert!(popup_data(&f, entity).client_geometry.is_none());
+    assert_eq!(f.connection().window(popup).dims, dims);
+}
+
+#[test]
+fn popup_newer_x_resize_survives_the_older_reply_being_applied() {
+    // The client resizes the popup again between the repositioned event answering its
+    // previous size and the configure applying it. Applying that older answer must not
+    // retire the newer size, which a parent refresh in the meantime still asks for.
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let (_, output) = f.new_output(0, 0);
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, window);
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+    let popup = Window::new(2);
+    let (_, p_id) = f.create_popup(&comp, PopupBuilder::new(popup, window, id).x(20).y(20));
+    f.testwl.move_surface_to_output(p_id, &output);
+    f.run();
+    let state = |f: &TestFixture<FakeXConnection>| {
+        let data = f.testwl.get_surface_data(p_id).unwrap();
+        let pos = &data.popup().positioner_state;
+        (pos.anchor_rect.as_ref().unwrap().size, pos.size.unwrap())
+    };
+    let v = |x, y| testwl::Vec2 { x, y };
+    let mut dims = f.connection().window(popup).dims;
+
+    f.testwl.hold_reposition_replies(true);
+    dims.width = 60;
+    f.reconfigure_window(popup, dims, true);
+    f.run();
+    assert_eq!(state(&f), (v(100, 100), v(60, 50)));
+    assert!(f.testwl.release_repositioned_only());
+    f.run();
+
+    dims.width = 70;
+    f.reconfigure_window(popup, dims, true);
+    f.run();
+    assert_eq!(state(&f), (v(100, 100), v(70, 50)));
+
+    // The older answer (60) is applied; the newer size stands.
+    f.testwl.release_staged_configure();
+    f.run();
+    f.run();
+    assert_eq!(f.connection().window(popup).dims.width, 60);
+    f.testwl.configure_toplevel(id, 110, 100, vec![]);
+    f.run();
+    f.run();
+    assert_eq!(state(&f), (v(110, 100), v(70, 50)));
+
+    while f.testwl.release_reposition_reply() {
+        f.run();
+        f.run();
+    }
+    assert_eq!(f.connection().window(popup).dims, dims);
+    assert_eq!(state(&f), (v(110, 100), v(70, 50)));
+}
+
+#[test]
 fn client_side_decorations_no_global() {
     let mut f = TestFixture::new_pre_connect(|testwl| {
         testwl.disable_decorations_global();

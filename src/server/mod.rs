@@ -243,6 +243,22 @@ struct XdgSurfaceData {
     surface: XdgSurface,
     configured: bool,
     pending: Option<PendingSurfaceState>,
+    /// Whether the buffer attached to the host surface since its last commit is non-null, if
+    /// one was attached.
+    pending_buffer: Option<bool>,
+    /// A buffer is committed to the host surface, i.e. the surface is mapped there.
+    mapped: bool,
+}
+
+impl XdgSurfaceData {
+    /// Records that the host surface was committed. Returns whether that mapped it.
+    fn committed(&mut self) -> bool {
+        let was_mapped = self.mapped;
+        if let Some(has_buffer) = self.pending_buffer.take() {
+            self.mapped = has_buffer;
+        }
+        self.mapped && !was_mapped
+    }
 }
 
 #[derive(Debug)]
@@ -253,34 +269,162 @@ struct ToplevelData {
     decoration: decoration::DecorationsData,
 }
 
-#[derive(Debug)]
-struct PopupData {
-    popup: XdgPopup,
-    /// The positioner last used; a new one is built from the fields below for each
-    /// reposition, so that no stale state (e.g. a parent configure serial) is carried over.
-    positioner: XdgPositioner,
-    xdg: XdgSurfaceData,
-    parent: Entity,
-    /// The popup's logical size.
-    size: (i32, i32),
-    /// The popup's offset from the anchor, in the parent's logical coordinates.
-    offset: (i32, i32),
+/// What a reposition asked for, kept to interpret the configure that answers it. The X
+/// geometry each logical value was derived from is kept alongside, so that a configure that
+/// echoes the request restores that geometry exactly instead of being converted back through
+/// lossy rounding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PopupRequest {
     /// Origin of the positioner's anchor rect within the parent's window geometry, i.e. where
     /// the parent's X window content starts. This is non-zero when satellite draws the parent's
     /// titlebar, which is part of the parent's window geometry but not of its X window.
     anchor_origin: (i32, i32),
     /// Size of the positioner's anchor rect, i.e. the parent's X window content size.
     anchor_size: (i32, i32),
+    /// Offset from the anchor in the parent's logical coordinates, and the X offset from the
+    /// parent's window it was derived from.
+    offset: (i32, i32),
+    x_offset: (i32, i32),
+    /// The popup's logical size, and the X size it was derived from.
+    size: (i32, i32),
+    x_size: (u16, u16),
+}
+
+impl PopupRequest {
+    /// Derives the offset and size from the popup's and parent's X geometry: the offset is in
+    /// the parent's logical coordinates, the size in the popup's own.
+    ///
+    /// A window's X position is relative to its output (it includes the output's offset, see
+    /// `WindowData::update_output_offset`), so each position is taken relative to the offset
+    /// given with it. A popup that has not been configured yet is where the X client put it
+    /// relative to the parent, so its position is given with the parent's offset.
+    fn update_geometry(
+        &mut self,
+        (popup_dims, popup_offset): (WindowDims, WindowOutputOffset),
+        (parent_dims, parent_offset): (WindowDims, WindowOutputOffset),
+        parent_scale: f64,
+        popup_scale: f64,
+    ) {
+        self.x_offset = (
+            (i32::from(popup_dims.x) - popup_offset.x)
+                - (i32::from(parent_dims.x) - parent_offset.x),
+            (i32::from(popup_dims.y) - popup_offset.y)
+                - (i32::from(parent_dims.y) - parent_offset.y),
+        );
+        self.offset = (
+            (self.x_offset.0 as f64 / parent_scale) as i32,
+            (self.x_offset.1 as f64 / parent_scale) as i32,
+        );
+        self.x_size = (popup_dims.width, popup_dims.height);
+        self.size = (
+            1.max((popup_dims.width as f64 / popup_scale) as i32),
+            1.max((popup_dims.height as f64 / popup_scale) as i32),
+        );
+    }
+}
+
+/// See `PopupData::client_geometry`.
+#[derive(Debug, Clone, Copy)]
+struct ClientGeometry {
+    dims: WindowDims,
+    /// The output offset the position is relative to.
+    offset: WindowOutputOffset,
+    /// The token of the first reposition made from this geometry, once one was.
+    sent_with: Option<u32>,
+    /// That reposition (or a later one) has been answered; the configure that follows applies
+    /// the answer, and retires this geometry.
+    answered: bool,
+}
+
+#[derive(Debug)]
+struct PopupData {
+    popup: XdgPopup,
+    /// The positioner last used; a new one is built from `request` for each reposition, so
+    /// that no stale state (e.g. a parent configure serial) is carried over.
+    positioner: XdgPositioner,
+    xdg: XdgSurfaceData,
+    parent: Entity,
+    /// What the next reposition asks for.
+    request: PopupRequest,
+    /// What the compositor was last asked for: the request the initial positioner or the
+    /// last reposition was built from. `request` may be ahead of it while the popup cannot
+    /// be repositioned yet.
+    sent: PopupRequest,
+    /// The X geometry the client last gave the popup, until a configure answering a request
+    /// made from it has been applied. Requests are derived from it rather than from the X
+    /// window's geometry, which a configure answering an older request (the initial one, or
+    /// one in flight when the client resized) may have replaced in the meantime.
+    client_geometry: Option<ClientGeometry>,
     /// The parent's future window geometry (content plus titlebar) to constrain against, and
     /// the parent's configure serial a reposition responds to, if any.
     parent_size: Option<(i32, i32)>,
     parent_configure: Option<u32>,
-    /// The anchor origin the next configure was positioned with. Repositions are answered
-    /// asynchronously, so this lags `anchor_origin` until the matching repositioned event.
-    configure_anchor: (i32, i32),
-    /// Anchor origins of repositions not yet answered, by token.
-    pending_anchors: Vec<(u32, (i32, i32))>,
+    /// The request the next configure answers. Repositions are answered asynchronously, so
+    /// this lags `request` until the matching repositioned event.
+    configure_request: PopupRequest,
+    /// Requests of repositions not yet answered, by token.
+    pending_requests: Vec<(u32, PopupRequest)>,
     next_reposition_token: u32,
+}
+
+impl PopupData {
+    /// Sets the positioner up from the popup's current state.
+    fn configure_positioner(&self, positioner: &XdgPositioner) {
+        set_up_positioner(
+            positioner,
+            self.request.size,
+            self.request.offset,
+            self.request.anchor_origin,
+            self.request.anchor_size,
+            self.parent_size,
+            self.parent_configure,
+        );
+    }
+
+    /// Repositions with a positioner built from the current state, remembering which request
+    /// the response is to be interpreted with.
+    fn reposition(&mut self, wm_base: &XdgWmBase, qh: &QueueHandle<MyWorld>) {
+        let positioner = wm_base.create_positioner(qh, ());
+        self.configure_positioner(&positioner);
+        let token = self.next_reposition_token;
+        self.next_reposition_token = self.next_reposition_token.wrapping_add(1);
+        self.pending_requests.push((token, self.request));
+        self.sent = self.request;
+        if let Some(geometry) = &mut self.client_geometry {
+            geometry.sent_with.get_or_insert(token);
+        }
+        self.popup.reposition(&positioner, token);
+        self.positioner.destroy();
+        self.positioner = positioner;
+    }
+
+    /// The compositor answered the reposition with this token (earlier ones may have been
+    /// skipped); the following configure is interpreted with that request.
+    fn repositioned(&mut self, token: u32) {
+        if let Some(index) = self.pending_requests.iter().position(|(t, _)| *t == token) {
+            self.configure_request = self.pending_requests[index].1;
+            // The client's geometry is answered if the request made from it is this one or
+            // one the compositor skipped in favour of it. Tokens wrap, so this goes by the
+            // order the requests were made in rather than by their values.
+            let answered = self.pending_requests[..=index].iter().any(|(t, _)| {
+                self.client_geometry
+                    .is_some_and(|g| g.sent_with == Some(*t))
+            });
+            if let Some(geometry) = &mut self.client_geometry {
+                geometry.answered |= answered;
+            }
+            self.pending_requests.drain(..=index);
+        }
+    }
+
+    /// The configure answering a reposition was applied to the X window.
+    fn configured(&mut self) {
+        // From here on the X window's geometry is what the compositor granted the client's,
+        // unless the client gave it a newer one since.
+        if self.client_geometry.is_some_and(|g| g.answered) {
+            self.client_geometry = None;
+        }
+    }
 }
 
 /// Sets a positioner up for a popup of the given logical size at `offset` from the anchor
@@ -311,43 +455,6 @@ fn set_up_positioner(
     }
     if let Some(serial) = parent_configure {
         positioner.set_parent_configure(serial);
-    }
-}
-
-impl PopupData {
-    /// Sets the positioner up from the popup's current state.
-    fn configure_positioner(&self, positioner: &XdgPositioner) {
-        set_up_positioner(
-            positioner,
-            self.size,
-            self.offset,
-            self.anchor_origin,
-            self.anchor_size,
-            self.parent_size,
-            self.parent_configure,
-        );
-    }
-
-    /// Repositions with a positioner built from the current state, remembering which anchor
-    /// origin the response is to be converted with.
-    fn reposition(&mut self, wm_base: &XdgWmBase, qh: &QueueHandle<MyWorld>) {
-        let positioner = wm_base.create_positioner(qh, ());
-        self.configure_positioner(&positioner);
-        let token = self.next_reposition_token;
-        self.next_reposition_token = self.next_reposition_token.wrapping_add(1);
-        self.pending_anchors.push((token, self.anchor_origin));
-        self.popup.reposition(&positioner, token);
-        self.positioner.destroy();
-        self.positioner = positioner;
-    }
-
-    /// The compositor answered the reposition with this token (earlier ones may have been
-    /// skipped); the following configure is positioned with that request's anchor.
-    fn repositioned(&mut self, token: u32) {
-        if let Some(index) = self.pending_anchors.iter().position(|(t, _)| *t == token) {
-            self.configure_anchor = self.pending_anchors[index].1;
-            self.pending_anchors.drain(..=index);
-        }
     }
 }
 
@@ -1233,13 +1340,48 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
 
         match role {
             SurfaceRole::Popup(Some(popup)) => {
-                popup.offset = (
-                    ((event.x() as i32 - win.output_offset.x) as f64 / scale_factor.0) as i32,
-                    ((event.y() as i32 - win.output_offset.y) as f64 / scale_factor.0) as i32,
-                );
-                popup.size = (
-                    1.max((event.width() as f64 / scale_factor.0) as i32),
-                    1.max((event.height() as f64 / scale_factor.0) as i32),
+                let own_offset = win.output_offset;
+                // The parent may share the popup's archetype; release the popup's window data
+                // before borrowing the parent's.
+                drop(win);
+                let (parent, parent_scale) = {
+                    let Ok(mut parent) = self
+                        .world
+                        .query_one::<(&WindowData, &SurfaceScaleFactor)>(popup.parent)
+                    else {
+                        return;
+                    };
+                    let Some((parent_window, parent_scale)) = parent.get() else {
+                        return;
+                    };
+                    (
+                        (parent_window.attrs.dims, parent_window.output_offset),
+                        parent_scale.0,
+                    )
+                };
+                // Before its first configure the popup is where the X client put it relative
+                // to the parent, i.e. in the parent's output's frame (see create_popup).
+                let popup_offset = if popup.xdg.configured {
+                    own_offset
+                } else {
+                    parent.1
+                };
+                popup.client_geometry = Some(ClientGeometry {
+                    dims,
+                    offset: popup_offset,
+                    sent_with: None,
+                    answered: false,
+                });
+                // Only a mapped popup can be repositioned; until then the refresh queued
+                // when the popup is mapped sends the client's geometry.
+                if !popup.xdg.mapped {
+                    return;
+                }
+                popup.request.update_geometry(
+                    (dims, popup_offset),
+                    parent,
+                    parent_scale,
+                    scale_factor.0,
                 );
                 // Not in response to any configure of the parent.
                 popup.parent_configure = None;
@@ -1701,6 +1843,8 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                 surface: xdg,
                 configured: false,
                 pending: None,
+                pending_buffer: None,
+                mapped: false,
             },
             toplevel,
             fullscreen: false,
@@ -1749,6 +1893,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             return;
         };
         let parent_dims = parent_window.attrs.dims;
+        let parent_offset = parent_window.output_offset;
         let scale = parent_scale.0;
         let (anchor_origin, (width, height)) = popup_anchor(parent_role, parent_dims, scale);
         drop(parent_query);
@@ -1773,30 +1918,40 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             let SurfaceRole::Popup(Some(popup)) = role else {
                 continue;
             };
-            // The popup's logical size follows its own scale, so that a scale change keeps
-            // its X size rather than resizing it.
-            let size = (
-                1.max((window.attrs.dims.width as f64 / popup_scale.0) as i32),
-                1.max((window.attrs.dims.height as f64 / popup_scale.0) as i32),
+            // Until a buffer is committed to it the popup is not mapped, and is positioned by
+            // its initial positioner; only a mapped popup can be repositioned.
+            if !popup.xdg.mapped {
+                continue;
+            }
+            let mut request = popup.request;
+            request.anchor_origin = anchor_origin;
+            request.anchor_size = (width, height);
+            // The offset follows the parent's scale, the size the popup's own, so that a
+            // scale change keeps the popup where it is and at its X size. A geometry the X
+            // client asked for that is not answered yet takes precedence over the window's
+            // current one.
+            let popup_geometry = popup
+                .client_geometry
+                .map(|g| (g.dims, g.offset))
+                .unwrap_or((window.attrs.dims, window.output_offset));
+            request.update_geometry(
+                popup_geometry,
+                (parent_dims, parent_offset),
+                scale,
+                popup_scale.0,
             );
-            if popup.anchor_origin == anchor_origin
-                && popup.anchor_size == (width, height)
-                && popup.size == size
-                && serial.is_none()
-            {
+            if request == popup.sent {
+                // What the client asked for is what was last asked of the compositor.
+                if popup.client_geometry.is_some_and(|g| g.sent_with.is_none()) {
+                    popup.client_geometry = None;
+                }
                 continue;
             }
             debug!("re-anchoring popup {entity:?} to {anchor_origin:?} {width}x{height}");
-            popup.anchor_origin = anchor_origin;
-            popup.anchor_size = (width, height);
-            popup.size = size;
+            popup.request = request;
             // The parent's window geometry is its content plus the titlebar above it.
             popup.parent_size = Some((width, height + anchor_origin.1));
             popup.parent_configure = serial;
-            popup.offset = (
-                ((window.attrs.dims.x - parent_dims.x) as f64 / scale) as i32,
-                ((window.attrs.dims.y - parent_dims.y) as f64 / scale) as i32,
-            );
             popup.reposition(&self.xdg_wm_base, &self.qh);
         }
     }
@@ -1828,21 +1983,28 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         let (anchor_origin, (parent_width, parent_height)) =
             popup_anchor(parent_role, parent_dims, initial_scale);
 
-        let size = (
-            1.max((window.attrs.dims.width as f64 / initial_scale) as i32),
-            1.max((window.attrs.dims.height as f64 / initial_scale) as i32),
-        );
-        let offset = (
-            ((window.attrs.dims.x - parent_dims.x) as f64 / initial_scale) as i32,
-            ((window.attrs.dims.y - parent_dims.y) as f64 / initial_scale) as i32,
+        let mut request = PopupRequest {
+            anchor_origin,
+            anchor_size: (parent_width, parent_height),
+            offset: (0, 0),
+            x_offset: (0, 0),
+            size: (1, 1),
+            x_size: (0, 0),
+        };
+        // The X client positioned the popup relative to the parent's X window.
+        request.update_geometry(
+            (window.attrs.dims, parent_window.output_offset),
+            (parent_dims, parent_window.output_offset),
+            initial_scale,
+            initial_scale,
         );
         let positioner = self.xdg_wm_base.create_positioner(&self.qh, ());
         set_up_positioner(
             &positioner,
-            size,
-            offset,
-            anchor_origin,
-            (parent_width, parent_height),
+            request.size,
+            request.offset,
+            request.anchor_origin,
+            request.anchor_size,
             None,
             None,
         );
@@ -1853,26 +2015,26 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             entity,
         );
 
-        let data = PopupData {
+        PopupData {
             popup,
             positioner,
             parent: self.windows[&parent],
-            size,
-            offset,
-            anchor_origin,
-            anchor_size: (parent_width, parent_height),
+            request,
+            sent: request,
+            client_geometry: None,
             parent_size: None,
             parent_configure: None,
-            configure_anchor: anchor_origin,
-            pending_anchors: Vec::new(),
+            configure_request: request,
+            pending_requests: Vec::new(),
             next_reposition_token: 1,
             xdg: XdgSurfaceData {
                 surface: xdg,
                 configured: false,
                 pending: None,
+                pending_buffer: None,
+                mapped: false,
             },
-        };
-        data
+        }
     }
 }
 
