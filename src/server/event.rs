@@ -232,7 +232,9 @@ impl SurfaceEvents {
                     if state.last_focused_toplevel == Some(*window) {
                         let output = get_output_name(Some(&on_output), &state.world);
                         debug!("focused window changed outputs - resetting primary output");
-                        connection.focus_window(*window, output);
+                        // Only the primary output changes; how the window holds focus is its
+                        // input model's business and was settled when it was activated.
+                        connection.activate_window(*window, output);
                     }
 
                     if state.fractional_scale.is_none() {
@@ -561,14 +563,15 @@ impl SurfaceEvents {
                 });
 
                 if first_configure {
-                    let window_data = data.get::<&WindowData>().unwrap();
-                    if window_data.attrs.require_wm_focus() {
-                        let window = *data.get::<&x::Window>().unwrap();
+                    let attrs = &data.get::<&WindowData>().unwrap().attrs;
+                    let window = *data.get::<&x::Window>().unwrap();
+                    let action = attrs.focus_action();
+                    if !attrs.override_redirect && action != FocusAction::None {
                         state.inner.to_focus = Some(FocusData {
                             window,
                             output_name: None,
                             is_popup: true,
-                            has_take_focus: window_data.attrs.has_take_focus,
+                            action,
                         });
                     }
                 }
@@ -984,10 +987,17 @@ impl Event for client::wl_keyboard::Event {
                 let mut query = surface.data().copied().and_then(|key| {
                     state
                         .world
-                        .query_one::<(&x::Window, &WlSurface, Option<&OnOutput>)>(key)
+                        .query_one::<(
+                            &x::Window,
+                            &WlSurface,
+                            Option<&OnOutput>,
+                            Option<&WindowData>,
+                        )>(key)
                         .ok()
                 });
-                let Some((window, surface, output)) = query.as_mut().and_then(|q| q.get()) else {
+                let Some((window, surface, output, window_data)) =
+                    query.as_mut().and_then(|q| q.get())
+                else {
                     return;
                 };
                 state.last_kb_serial = Some((
@@ -998,13 +1008,14 @@ impl Event for client::wl_keyboard::Event {
                     serial,
                 ));
                 let output_name = get_output_name(output, &state.world);
-                let window_data = data.get::<&WindowData>();
-                let has_take_focus = window_data.as_ref().is_some_and(|d| d.attrs.has_take_focus);
+                let action = window_data
+                    .map(|d| d.attrs.focus_action())
+                    .unwrap_or(FocusAction::Direct);
                 state.to_focus = Some(FocusData {
                     window: *window,
                     output_name,
                     is_popup: false,
-                    has_take_focus,
+                    action,
                 });
                 keyboard.enter(serial, surface, keys);
             }
