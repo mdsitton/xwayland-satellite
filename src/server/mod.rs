@@ -945,7 +945,10 @@ impl<C: XConnection> ServerState<C> {
     /// The fd that window position updates arrive on, if we are following niri's layout.
     pub fn niri_fd(&self) -> Option<std::os::fd::RawFd> {
         use std::os::fd::AsRawFd;
-        self.inner.niri.as_ref().map(|niri| niri.as_fd().as_raw_fd())
+        self.inner
+            .niri
+            .as_ref()
+            .map(|niri| niri.as_fd().as_raw_fd())
     }
 
     /// Reads window positions from niri and moves X windows to match.
@@ -1010,6 +1013,55 @@ impl<C: XConnection> ServerState<C> {
         self.update_window_positions_inner(only_new);
     }
 
+    /// Asks the compositor to move a window where its own client wants it.
+    ///
+    /// Returns whether the compositor was asked, which is the case for a floating window under a
+    /// compositor that takes move requests. Otherwise the client's wish cannot be granted, and
+    /// the window stays where the compositor put it.
+    pub(crate) fn move_window_to(&mut self, window: x::Window, position: Point<Physical>) -> bool {
+        let Some(niri) = &self.inner.niri else {
+            return false;
+        };
+        let Some(entity) = self.inner.windows.get(&window).copied() else {
+            return false;
+        };
+
+        let Ok(mut query) = self.inner.world.query_one::<(
+            &SurfaceRole,
+            &SurfaceScaleFactor,
+            &client::wl_surface::WlSurface,
+        )>(entity) else {
+            return false;
+        };
+        let Some((role, scale, surface)) = query.get() else {
+            return false;
+        };
+        if !matches!(role, SurfaceRole::Toplevel(_)) {
+            return false;
+        }
+
+        let Some((id, current)) = niri.floating_window(surface.id().protocol_id()) else {
+            return false;
+        };
+
+        // The request is in X root coordinates; the compositor thinks in logical pixels within
+        // the window's output.
+        let Some(output) = self.inner.output_of(entity) else {
+            return false;
+        };
+        let (x, y) = position.delta_from(output).to_logical_f64(scale.0);
+        let (dx, dy) = (x - current.x, y - current.y);
+        drop(query);
+
+        if dx == 0. && dy == 0. {
+            return true;
+        }
+
+        debug!("asking the compositor to move {window:?} by {dx}x{dy}");
+        niri.move_floating_window(id, dx, dy);
+        true
+    }
+
     /// Puts every toplevel where the compositor says it is.
     ///
     /// X clients work out what the pointer is over from these positions, so they have to match
@@ -1037,8 +1089,7 @@ impl<C: XConnection> ServerState<C> {
                     continue;
                 }
 
-                let Some((output, position)) = niri.placement_of(surface.id().protocol_id())
-                else {
+                let Some((output, position)) = niri.placement_of(surface.id().protocol_id()) else {
                     continue;
                 };
                 let Some(offset) = self.inner.output_position(output) else {
@@ -1080,7 +1131,10 @@ impl<C: XConnection> ServerState<C> {
             };
             drop(data);
 
-            trace!("moving {window:?} to {}x{} to match the compositor", dims.x, dims.y);
+            trace!(
+                "moving {window:?} to {}x{} to match the compositor",
+                dims.x, dims.y
+            );
             self.connection.set_window_dims(window, dims);
             moved += 1;
         }
@@ -2365,6 +2419,16 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
 }
 
 impl<S: X11Selection> InnerServerState<S> {
+    /// Position of the output a window is on, in X root coordinates.
+    fn output_of(&self, window: Entity) -> Option<Point<Physical>> {
+        let on_output = self.world.get::<&OnOutput>(window).ok()?.0;
+        let dimensions = self.world.get::<&OutputDimensions>(on_output).ok()?;
+        Some(Point::new(
+            dimensions.x - self.global_output_offset.x.value,
+            dimensions.y - self.global_output_offset.y.value,
+        ))
+    }
+
     /// Position of the output with this name in X root coordinates.
     fn output_position(&self, name: &str) -> Option<Point<Physical>> {
         let mut query = self.world.query::<(&OutputName, &OutputDimensions)>();
