@@ -1,6 +1,6 @@
 use super::clientside::LateInitObjectKey;
 use super::decoration::DecorationMarker;
-use super::geometry::{Logical, Physical, Size};
+use super::geometry::{Logical, Physical, Point, Size};
 use super::*;
 use hecs::{CommandBuffer, World};
 use log::{debug, error, trace, warn};
@@ -366,10 +366,22 @@ impl SurfaceEvents {
                             + window_data.output_offset.y,
                     )
                 }
-                None => (
-                    (pending.x.max(0) as f64 * scale_factor.0) as i32 + window_data.output_offset.x,
-                    (pending.y.max(0) as f64 * scale_factor.0) as i32 + window_data.output_offset.y,
+                // A toplevel's configure carries no position: the compositor places the window
+                // and X never learns where. Once its client has chosen a position, keep that;
+                // otherwise park the window at its output's origin as before.
+                None if window_data.position_from_client => (
+                    i32::from(window_data.attrs.dims.x),
+                    i32::from(window_data.attrs.dims.y),
                 ),
+                None => {
+                    let placed = Point::<Logical>::new(pending.x.max(0), pending.y.max(0))
+                        .to_physical(scale_factor.0)
+                        .to_root(Point::new(
+                            window_data.output_offset.x,
+                            window_data.output_offset.y,
+                        ));
+                    (placed.x, placed.y)
+                }
             };
             let (echoed_width, echoed_height) = popup
                 .map(|(request, _, _)| {

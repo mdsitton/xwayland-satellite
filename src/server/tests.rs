@@ -2524,17 +2524,114 @@ fn reconfigure_toplevel() {
     };
     f.assert_window_dimensions(toplevel, surface, dims);
 
+    // A toplevel can resize and move itself. The compositor still decides where the window
+    // appears; the position lives only in X coordinates, where it is the one position the
+    // client can see (see WindowData::position_from_client).
     dims.width = 80;
     dims.height = 120;
-    let final_dims = dims;
-    // A toplevel can be resized, but not change position
     dims.x = 20;
     dims.y = 20;
     f.reconfigure_window(toplevel, dims, false);
     f.run();
     f.run();
 
-    f.assert_window_dimensions(toplevel, surface, final_dims);
+    f.assert_window_dimensions(toplevel, surface, dims);
+}
+
+#[test]
+fn toplevels_keep_distinct_positions() {
+    // Clients that manage their own layout, an editor docking a floating panel for instance,
+    // decide where a drag lands by hit-testing the pointer against each of their windows' X
+    // rectangles. Toplevels parked at their output's origin all share one rectangle, so a
+    // position the client chose has to survive both mapping and later moves.
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let main = Window::new(1);
+    let (_, main_surface) = f.create_toplevel(&comp, main);
+    let main_dims = WindowDims {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 100,
+    };
+    f.assert_window_dimensions(main, main_surface, main_dims);
+
+    let floating = Window::new(2);
+    let (buffer, surface) = comp.create_surface();
+    let placed = WindowDims {
+        x: 300,
+        y: 200,
+        width: 120,
+        height: 90,
+    };
+    f.new_window(
+        floating,
+        false,
+        WindowData {
+            mapped: true,
+            dims: placed,
+            fullscreen: false,
+        },
+    );
+    f.map_window(&comp, floating, &surface.obj, &buffer);
+    f.run();
+    let floating_surface = f.check_new_surface();
+    f.testwl.configure_toplevel(
+        floating_surface,
+        placed.width.into(),
+        placed.height.into(),
+        vec![],
+    );
+    f.run();
+    f.run();
+
+    f.assert_window_dimensions(floating, floating_surface, placed);
+    assert_ne!((main_dims.x, main_dims.y), (placed.x, placed.y));
+
+    let moved = WindowDims {
+        x: 50,
+        y: 400,
+        ..placed
+    };
+    f.reconfigure_window(floating, moved, false);
+    f.run();
+    f.run();
+    f.assert_window_dimensions(floating, floating_surface, moved);
+}
+
+#[test]
+fn a_clients_position_is_not_shifted_by_its_output() {
+    // The position a client chooses is in X root coordinates, which already account for where
+    // its output sits. Adding the output's offset on top would make the client ask for the
+    // shifted position next time, and the window would walk off the screen an output's width
+    // at a time until X stopped delivering it any input.
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    f.new_output(0, 0);
+    let (_, output) = f.new_output(500, 100);
+    f.run();
+    let window = Window::new(1);
+    let (_, surface) = f.create_toplevel(&comp, window);
+    let placed = WindowDims {
+        x: 700,
+        y: 300,
+        width: 100,
+        height: 100,
+    };
+    f.reconfigure_window(window, placed, false);
+    f.run();
+    f.run();
+    f.assert_window_dimensions(window, surface, placed);
+
+    // Entering an output at (500,100) must not move it.
+    f.testwl.move_surface_to_output(surface, &output);
+    f.run();
+    f.run();
+    f.assert_window_dimensions(window, surface, placed);
+
+    // Nor must the output moving under it.
+    f.testwl.move_output(&output, 900, 400);
+    f.run();
+    f.run();
+    f.assert_window_dimensions(window, surface, placed);
 }
 
 type EventMatcher<'a, Event> = Box<dyn FnMut(&Event) -> bool + 'a>;

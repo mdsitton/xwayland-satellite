@@ -7,6 +7,7 @@ mod tests;
 mod xresources;
 
 use crate::XConnection;
+use crate::server::geometry::{Physical, Point, Size};
 use bitflags::bitflags;
 use log::{debug, trace, warn};
 use std::collections::HashMap;
@@ -496,11 +497,35 @@ impl XState {
                     let mask = e.value_mask();
 
                     if server_state.can_change_position(e.window()) {
+                        // A position satellite keeps for the client has to leave the window
+                        // inside the X screen: X delivers no pointer input to the parts of a
+                        // window outside the root, so a window hanging off the edge would be
+                        // dead to the mouse.
+                        let (x_pos, y_pos) = if server_state.position_is_the_clients(e.window()) {
+                            let root = self.connection.wait_for_reply(
+                                self.connection.send_request(&x::GetGeometry {
+                                    drawable: x::Drawable::Window(self.root),
+                                }),
+                            );
+                            let size = Size::<Physical>::new(e.width().into(), e.height().into());
+                            let bounds = match &root {
+                                Ok(root) => {
+                                    Size::<Physical>::new(root.width().into(), root.height().into())
+                                }
+                                Err(_) => Size::<Physical>::new(i32::MAX, i32::MAX),
+                            };
+                            let clamped = Point::<Physical>::from_x(e.x(), e.y())
+                                .clamp_into(size, bounds)
+                                .to_x();
+                            (clamped.0, clamped.1)
+                        } else {
+                            (e.x(), e.y())
+                        };
                         if mask.contains(x::ConfigWindowMask::X) {
-                            list.push(x::ConfigWindow::X(e.x().into()));
+                            list.push(x::ConfigWindow::X(x_pos.into()));
                         }
                         if mask.contains(x::ConfigWindowMask::Y) {
-                            list.push(x::ConfigWindow::Y(e.y().into()));
+                            list.push(x::ConfigWindow::Y(y_pos.into()));
                         }
                     }
                     if mask.contains(x::ConfigWindowMask::WIDTH) {

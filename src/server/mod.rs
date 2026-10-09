@@ -2,7 +2,7 @@ mod clientside;
 mod decoration;
 mod dispatch;
 mod event;
-mod geometry;
+pub(crate) mod geometry;
 pub(crate) mod selection;
 #[cfg(test)]
 mod tests;
@@ -14,6 +14,7 @@ use crate::xstate::{
 use crate::{X11Selection, XConnection, timespec_from_millis};
 use clientside::MyWorld;
 use decoration::{DecorationsData, DecorationsDataSatellite};
+use geometry::{Physical, Point};
 use hecs::Entity;
 use log::{debug, error, warn};
 use rustix::event::{PollFd, PollFlags, poll};
@@ -177,11 +178,20 @@ struct WindowData {
     mapped: bool,
     attrs: WindowAttributes,
     output_offset: WindowOutputOffset,
+    /// The client chose this window's position, so `attrs.dims` is in X root coordinates of
+    /// its own choosing and belongs to no output's frame: `output_offset` stays zero and
+    /// satellite never shifts the window when its output moves. Reporting a shifted position
+    /// back would make the client request that position again, adding the offset a second
+    /// time, until the window walks off the screen and X stops delivering it any input.
+    position_from_client: bool,
     activation_token: Option<String>,
 }
 
 impl WindowData {
     fn new(override_redirect: bool, dims: WindowDims, activation_token: Option<String>) -> Self {
+        // A window created somewhere other than the origin has an opinion about where it
+        // belongs; one created at the origin has none, and satellite parks it at its output's.
+        let position_from_client = (dims.x, dims.y) != (0, 0);
         Self {
             mapped: false,
             attrs: WindowAttributes {
@@ -191,6 +201,7 @@ impl WindowData {
                 ..Default::default()
             },
             output_offset: WindowOutputOffset::default(),
+            position_from_client,
             activation_token,
         }
     }
@@ -205,20 +216,20 @@ impl WindowData {
         connection: &mut C,
     ) {
         log::trace!(target: "output_offset", "offset: {offset:?}");
-        if offset == self.output_offset {
+        if self.position_from_client || offset == self.output_offset {
+            // See WindowData::position_from_client: the offset stays zero, so every frame
+            // conversion that reads it keeps working on the client's own coordinates.
             return;
         }
 
-        let (dx, dy) = (
-            offset.x - self.output_offset.x,
-            offset.y - self.output_offset.y,
-        );
+        let delta = Point::<Physical>::new(offset.x, offset.y)
+            .delta_from(Point::new(self.output_offset.x, self.output_offset.y));
         let dims = &mut self.attrs.dims;
-        dims.x += dx as i16;
-        dims.y += dy as i16;
+        let moved = Point::from_x(dims.x, dims.y).to_root(delta).to_x();
+        (dims.x, dims.y) = moved;
         if let Some(pending) = pending {
-            pending.x += dx;
-            pending.y += dy;
+            pending.x += delta.x;
+            pending.y += delta.y;
         }
         self.output_offset = offset;
 
@@ -1398,18 +1409,24 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         self.world.insert(id, (SurfaceSerial(serial),)).unwrap();
     }
 
-    pub fn can_change_position(&self, window: x::Window) -> bool {
-        let Some(win) = self
-            .windows
+    /// Whether satellite keeps this window's position for its client, which is when a
+    /// position that falls outside the X screen has to be clamped back into it.
+    pub fn position_is_the_clients(&self, window: x::Window) -> bool {
+        self.windows
             .get(&window)
             .copied()
             .and_then(|id| self.world.entity(id).ok())
-            .map(|data| data.get::<&WindowData>().unwrap())
-        else {
-            return true;
-        };
+            .and_then(|data| data.get::<&WindowData>().map(|w| !w.attrs.role.is_popup()))
+            .unwrap_or(false)
+    }
 
-        !win.mapped || win.attrs.role.is_popup()
+    pub fn can_change_position(&self, _window: x::Window) -> bool {
+        // Where a window appears is the compositor's business, but its X position is the only
+        // one its client can ever see, and clients that manage their own layout hit-test the
+        // pointer against it: an editor dragging a floating panel back into its main window
+        // compares the two windows' rectangles, and toplevels parked at their output's origin
+        // share one rectangle. See WindowData::position_from_client.
+        true
     }
 
     pub fn reconfigure_window(&mut self, event: x::ConfigureNotifyEvent) {
@@ -1502,8 +1519,12 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                 popup.reposition(&self.xdg_wm_base, &self.qh);
             }
             SurfaceRole::Toplevel(Some(_)) => {
-                win.attrs.dims.width = dims.width;
-                win.attrs.dims.height = dims.height;
+                if (dims.x, dims.y) != (win.attrs.dims.x, win.attrs.dims.y) {
+                    // The client placed itself; its coordinates are ours from now on.
+                    win.position_from_client = true;
+                    win.output_offset = WindowOutputOffset::default();
+                }
+                win.attrs.dims = dims;
                 drop(query);
                 drop(win);
                 update_surface_viewport(&self.world, self.world.query_one(data.entity()).unwrap());
@@ -2108,6 +2129,8 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         // echoed position is repositioned as if it were on the first output, which pushes the
         // popup off its parent.
         window.output_offset = parent_window.output_offset;
+        // The popup's position is derived from its parent's, so it shares the parent's frame.
+        window.position_from_client = parent_window.position_from_client;
 
         debug!(
             "creating popup ({:?}) {:?} {:?} {:?} {entity:?} (scale: {initial_scale})",
