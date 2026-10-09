@@ -994,6 +994,8 @@ impl<C: XConnection> ServerState<C> {
                 continue;
             };
 
+            // X positions are 16-bit, and a window anchored to one that scrolled far out of
+            // view can be well past that, so take the clamped position for both.
             let (x, y) = placed.to_x();
             data.attrs.dims.x = x;
             data.attrs.dims.y = y;
@@ -1001,8 +1003,8 @@ impl<C: XConnection> ServerState<C> {
             // longer something to preserve.
             data.position_from_client = false;
             let dims = PendingSurfaceState {
-                x: placed.x,
-                y: placed.y,
+                x: x.into(),
+                y: y.into(),
                 width: data.attrs.dims.width.into(),
                 height: data.attrs.dims.height.into(),
             };
