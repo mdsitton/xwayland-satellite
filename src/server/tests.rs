@@ -982,8 +982,8 @@ impl TestFixture<FakeXConnection> {
                 assert_eq!(win_data.attrs.dims, dims);
 
                 let viewport = data.viewport.as_ref().expect("Missing viewport");
-                assert_eq!(viewport.width, dims.width as _);
-                assert_eq!(viewport.height, dims.height as _);
+                assert_eq!(viewport.width, i32::from(dims.width));
+                assert_eq!(viewport.height, i32::from(dims.height));
             }
             ref e => {
                 panic!("tried to assert dimensions of something not a toplevel or popup: {e:?}",);

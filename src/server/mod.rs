@@ -790,6 +790,8 @@ pub struct InnerServerState<S: X11Selection> {
     pending_popup_refresh: Vec<Entity>,
     new_scale: Option<f64>,
     current_scale: f64,
+    /// Where the compositor has put our windows, when it is niri and tells us.
+    niri: Option<crate::niri::Niri>,
 }
 
 impl<S: X11Selection> ServerState<NoConnection<S>> {
@@ -903,6 +905,7 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             current_scale: 1.0,
             decoration_manager,
             world,
+            niri: crate::niri::Niri::connect(),
         };
         Self {
             inner,
@@ -924,6 +927,92 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
 }
 
 impl<C: XConnection> ServerState<C> {
+    /// The fd that window position updates arrive on, if we are following niri's layout.
+    pub fn niri_fd(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+        self.inner.niri.as_ref().map(|niri| niri.as_fd().as_raw_fd())
+    }
+
+    /// Reads window positions from niri and moves X windows to match.
+    pub fn handle_niri_events(&mut self) {
+        let moved = match &mut self.inner.niri {
+            Some(niri) => niri.read_events(),
+            None => return,
+        };
+
+        if moved {
+            self.update_window_positions();
+        }
+    }
+
+    /// Puts every toplevel where the compositor says it is.
+    ///
+    /// X clients work out what the pointer is over from these positions, so they have to match
+    /// what is on screen, not just be distinct from each other.
+    fn update_window_positions(&mut self) {
+        let Some(niri) = &self.inner.niri else {
+            return;
+        };
+
+        let mut moves = Vec::new();
+        {
+            let mut query = self.inner.world.query::<(
+                &x::Window,
+                &WindowData,
+                &SurfaceRole,
+                &SurfaceScaleFactor,
+                &client::wl_surface::WlSurface,
+            )>();
+
+            for (entity, (window, data, role, scale, surface)) in query.into_iter() {
+                if !data.mapped || !matches!(role, SurfaceRole::Toplevel(_)) {
+                    continue;
+                }
+
+                let Some((output, position)) = niri.placement_of(surface.id().protocol_id())
+                else {
+                    continue;
+                };
+                let Some(offset) = self.inner.output_position(output) else {
+                    continue;
+                };
+
+                let placed = Point::<geometry::Logical>::new(position.x as i32, position.y as i32)
+                    .to_physical(scale.0)
+                    .to_root(offset);
+                let (x, y) = placed.to_x();
+                if (x, y) == (data.attrs.dims.x, data.attrs.dims.y) {
+                    continue;
+                }
+
+                moves.push((entity, *window, placed));
+            }
+        }
+
+        for (entity, window, placed) in moves {
+            let Ok(mut data) = self.inner.world.get::<&mut WindowData>(entity) else {
+                continue;
+            };
+
+            let (x, y) = placed.to_x();
+            data.attrs.dims.x = x;
+            data.attrs.dims.y = y;
+            // The compositor decides where the window goes, so its own idea of a position is no
+            // longer something to preserve.
+            data.position_from_client = false;
+            let dims = PendingSurfaceState {
+                x: placed.x,
+                y: placed.y,
+                width: data.attrs.dims.width.into(),
+                height: data.attrs.dims.height.into(),
+            };
+            drop(data);
+
+            debug!("moving {window:?} to {:?}x{:?} to match the compositor", dims.x, dims.y);
+            self.connection.set_window_dims(window, dims);
+        }
+    }
+
     pub fn run(&mut self) {
         if let Some(r) = self.queue.prepare_read() {
             let fd = r.connection_fd();
@@ -2195,6 +2284,22 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                 mapped: false,
             },
         }
+    }
+}
+
+impl<S: X11Selection> InnerServerState<S> {
+    /// Position of the output with this name in X root coordinates.
+    fn output_position(&self, name: &str) -> Option<Point<Physical>> {
+        let mut query = self.world.query::<(&OutputName, &OutputDimensions)>();
+        query
+            .into_iter()
+            .find(|(_, (output_name, _))| output_name.0 == name)
+            .map(|(_, (_, dimensions))| {
+                Point::new(
+                    dimensions.x - self.global_output_offset.x.value,
+                    dimensions.y - self.global_output_offset.y.value,
+                )
+            })
     }
 }
 

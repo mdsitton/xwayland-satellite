@@ -1,3 +1,4 @@
+mod niri;
 mod server;
 pub mod xstate;
 
@@ -175,13 +176,17 @@ pub fn main(mut data: impl RunData) -> Option<()> {
     // the UnixStream of choice when not running the integration tests.
     let mut quit_rx = data.quit_rx().unwrap_or(finish_rx);
 
-    let mut fds = [
+    let mut fds = vec![
         PollFd::from_borrowed_fd(server_fd, PollFlags::IN),
         PollFd::new(&xsock_wl, PollFlags::IN),
         PollFd::from_borrowed_fd(display_fd, PollFlags::IN),
         PollFd::new(&quit_rx, PollFlags::IN),
         PollFd::new(&ready_rx, PollFlags::IN),
     ];
+    if let Some(fd) = server_state.niri_fd() {
+        let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+        fds.push(PollFd::from_borrowed_fd(fd, PollFlags::IN));
+    }
 
     loop {
         match poll(&mut fds, None) {
@@ -234,6 +239,7 @@ pub fn main(mut data: impl RunData) -> Option<()> {
 
     loop {
         xstate.handle_events(&mut server_state);
+        server_state.handle_niri_events();
 
         display.dispatch_clients(&mut *server_state).unwrap();
         server_state.run();

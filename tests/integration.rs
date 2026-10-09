@@ -254,8 +254,8 @@ impl Fixture {
         });
         assert_eq!(geometry.x(), 0);
         assert_eq!(geometry.y(), 0);
-        assert_eq!(geometry.width(), (u_width as f32 * scale) as _);
-        assert_eq!(geometry.height(), (u_height as f32 * scale) as _);
+        assert_eq!(geometry.width(), (u_width as f32 * scale) as u16);
+        assert_eq!(geometry.height(), (u_height as f32 * scale) as u16);
     }
 
     #[track_caller]
