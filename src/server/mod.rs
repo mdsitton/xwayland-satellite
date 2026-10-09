@@ -16,7 +16,7 @@ use clientside::MyWorld;
 use decoration::{DecorationsData, DecorationsDataSatellite};
 use geometry::{Physical, Point};
 use hecs::Entity;
-use log::{debug, error, warn};
+use log::{debug, error, trace, warn};
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::Timespec;
 use smithay_client_toolkit::activation::ActivationState;
@@ -792,6 +792,10 @@ pub struct InnerServerState<S: X11Selection> {
     current_scale: f64,
     /// Where the compositor has put our windows, when it is niri and tells us.
     niri: Option<crate::niri::Niri>,
+    /// Pointer buttons currently held down, which is when X window positions stay put.
+    pressed_buttons: HashSet<u32>,
+    /// When a compositor position last changed, while X has not been told yet.
+    positions_changed: Option<std::time::Instant>,
 }
 
 impl<S: X11Selection> ServerState<NoConnection<S>> {
@@ -906,6 +910,8 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             decoration_manager,
             world,
             niri: crate::niri::Niri::connect(),
+            pressed_buttons: HashSet::new(),
+            positions_changed: None,
         };
         Self {
             inner,
@@ -927,6 +933,9 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
 }
 
 impl<C: XConnection> ServerState<C> {
+    /// How long the compositor's positions have to hold still before X is told about them.
+    const POSITION_QUIET_PERIOD: Duration = Duration::from_millis(100);
+
     /// The fd that window position updates arrive on, if we are following niri's layout.
     pub fn niri_fd(&self) -> Option<std::os::fd::RawFd> {
         use std::os::fd::AsRawFd;
@@ -941,8 +950,42 @@ impl<C: XConnection> ServerState<C> {
         };
 
         if moved {
-            self.update_window_positions();
+            self.inner.positions_changed = Some(std::time::Instant::now());
         }
+        self.update_window_positions_if_due();
+    }
+
+    /// How long until the X windows are due to be moved, if a move is pending.
+    ///
+    /// `None` means nothing is pending, or that it waits on something other than time: while a
+    /// pointer button is held, the windows stay where they are until it is released.
+    pub fn positions_due_in(&self) -> Option<Duration> {
+        if !self.inner.pressed_buttons.is_empty() {
+            return None;
+        }
+
+        let changed = self.inner.positions_changed?;
+        Some(Self::POSITION_QUIET_PERIOD.saturating_sub(changed.elapsed()))
+    }
+
+    /// Moves X windows to the positions the compositor last reported, once those have settled.
+    ///
+    /// The compositor animates window movement, and following every frame of it would mean an X
+    /// request per window per frame: clients get a configure flood, and the X server recomputes
+    /// what the pointer is over every time, which is enough to break a drag. None of those
+    /// in-between positions are of any use to an X client, so we wait for the movement to stop
+    /// and send where everything ended up.
+    ///
+    /// Nothing moves at all while a pointer button is held. An X client that is dragging
+    /// something works in root coordinates it captured when the drag began, so the ground has to
+    /// stay still underneath it until it lets go.
+    fn update_window_positions_if_due(&mut self) {
+        if self.positions_due_in() != Some(Duration::ZERO) {
+            return;
+        }
+
+        self.inner.positions_changed = None;
+        self.update_window_positions();
     }
 
     /// Puts every toplevel where the compositor says it is.
@@ -989,6 +1032,7 @@ impl<C: XConnection> ServerState<C> {
             }
         }
 
+        let mut moved = 0usize;
         for (entity, window, placed) in moves {
             let Ok(mut data) = self.inner.world.get::<&mut WindowData>(entity) else {
                 continue;
@@ -1010,8 +1054,13 @@ impl<C: XConnection> ServerState<C> {
             };
             drop(data);
 
-            debug!("moving {window:?} to {:?}x{:?} to match the compositor", dims.x, dims.y);
+            trace!("moving {window:?} to {}x{} to match the compositor", dims.x, dims.y);
             self.connection.set_window_dims(window, dims);
+            moved += 1;
+        }
+
+        if moved > 0 {
+            debug!("moved {moved} window(s) to match the compositor");
         }
     }
 

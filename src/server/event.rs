@@ -967,6 +967,15 @@ impl Event for client::wl_pointer::Event {
                 server.button(serial, time, button, convert_wenum(button_state));
                 drop(query);
                 cmd.run_on(&mut state.world);
+
+                match button_state {
+                    WEnum::Value(client::wl_pointer::ButtonState::Pressed) => {
+                        state.pressed_buttons.insert(button);
+                    }
+                    _ => {
+                        state.pressed_buttons.remove(&button);
+                    }
+                }
             }
             _ => {
                 let (server, current_surface) = state

@@ -262,7 +262,13 @@ pub fn main(mut data: impl RunData) -> Option<()> {
             continue;
         }
 
-        match poll(&mut fds, None) {
+        // Wake up for a window move that is waiting on its rate limit, even if nothing else
+        // happens in the meantime.
+        let timeout = server_state
+            .positions_due_in()
+            .map(|due| timespec_from_millis(due.as_millis() as u64));
+
+        match poll(&mut fds, timeout.as_ref()) {
             Ok(_) => {
                 if !fds[3].revents().is_empty() {
                     let status = xwayland_exit_code(&mut quit_rx);
