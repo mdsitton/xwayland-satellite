@@ -1040,18 +1040,23 @@ impl<C: XConnection> ServerState<C> {
             return false;
         }
 
-        let Some((id, current)) = niri.floating_window(surface.id().protocol_id()) else {
+        let Some(id) = niri.floating_window(surface.id().protocol_id()) else {
             return false;
         };
-
-        // The request is in X root coordinates; the compositor thinks in logical pixels within
-        // the window's output.
-        let Some(output) = self.inner.output_of(entity) else {
-            return false;
-        };
-        let (x, y) = position.delta_from(output).to_logical_f64(scale.0);
-        let (dx, dy) = (x - current.x, y - current.y);
+        let scale = scale.0;
         drop(query);
+
+        // The compositor moves the window relative to where it is now, and so do we: the
+        // distance from where X has the window to where its client wants it. Going by the
+        // position the compositor last reported instead would overshoot, since a report of our
+        // own last move may not have arrived yet.
+        let Ok(data) = self.inner.world.get::<&WindowData>(entity) else {
+            return false;
+        };
+        let current = Point::<Physical>::from_x(data.attrs.dims.x, data.attrs.dims.y);
+        drop(data);
+
+        let (dx, dy) = position.delta_from(current).to_logical_f64(scale);
 
         if dx == 0. && dy == 0. {
             return true;

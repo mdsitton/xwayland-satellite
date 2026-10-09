@@ -249,15 +249,11 @@ impl Niri {
             .map(|(output, position)| (output.as_str(), *position))
     }
 
-    /// The window one of our surfaces belongs to, if it is a floating one that niri is placing,
-    /// together with where it is now.
-    pub(crate) fn floating_window(&self, surface_id: u32) -> Option<(u64, Position)> {
+    /// The window one of our surfaces belongs to, if it is a floating one whose position the
+    /// compositor will take requests about.
+    pub(crate) fn floating_window(&self, surface_id: u32) -> Option<u64> {
         self.windows.iter().find_map(|(id, window)| {
-            if window.surface_id != Some(surface_id) || !window.is_floating {
-                return None;
-            }
-            let (_, position) = window.placement.as_ref()?;
-            Some((*id, *position))
+            (window.surface_id == Some(surface_id) && window.is_floating).then_some(*id)
         })
     }
 

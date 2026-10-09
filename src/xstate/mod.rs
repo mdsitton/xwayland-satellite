@@ -505,23 +505,12 @@ impl XState {
                     let mask = e.value_mask();
 
                     if server_state.can_change_position(e.window()) {
-                        // The compositor places windows, so a client that wants one of its own
-                        // moved has to ask it to; where it agrees, the client gets the position
-                        // it asked for rather than one bent to fit the screen.
-                        let moved_by_compositor = mask
-                            .intersects(x::ConfigWindowMask::X | x::ConfigWindowMask::Y)
-                            && server_state.move_window_to(
-                                e.window(),
-                                Point::<Physical>::from_x(e.x(), e.y()),
-                            );
-
-                        // A position satellite keeps for the client has to leave the window
-                        // inside the X screen: X delivers no pointer input to the parts of a
-                        // window outside the root, so a window hanging off the edge would be
-                        // dead to the mouse.
-                        let (x_pos, y_pos) = if moved_by_compositor {
-                            (e.x(), e.y())
-                        } else if server_state.position_is_the_clients(e.window()) {
+                        // A position satellite gives a window has to leave it inside the X
+                        // screen: X delivers no pointer input to the parts of a window outside
+                        // the root, so a window hanging off the edge would be dead to the mouse.
+                        // The same bound applies to what the compositor is asked for, since a
+                        // window it puts out there is just as unreachable.
+                        let wanted = if server_state.position_is_the_clients(e.window()) {
                             let root = self.connection.wait_for_reply(
                                 self.connection.send_request(&x::GetGeometry {
                                     drawable: x::Drawable::Window(self.root),
@@ -534,13 +523,18 @@ impl XState {
                                 }
                                 Err(_) => Size::<Physical>::new(i32::MAX, i32::MAX),
                             };
-                            let clamped = Point::<Physical>::from_x(e.x(), e.y())
-                                .clamp_into(size, bounds)
-                                .to_x();
-                            (clamped.0, clamped.1)
+                            Point::<Physical>::from_x(e.x(), e.y()).clamp_into(size, bounds)
                         } else {
-                            (e.x(), e.y())
+                            Point::<Physical>::from_x(e.x(), e.y())
                         };
+
+                        // The compositor places windows, so a client that wants one of its own
+                        // moved has to ask it to.
+                        if mask.intersects(x::ConfigWindowMask::X | x::ConfigWindowMask::Y) {
+                            server_state.move_window_to(e.window(), wanted);
+                        }
+
+                        let (x_pos, y_pos) = wanted.to_x();
                         if mask.contains(x::ConfigWindowMask::X) {
                             list.push(x::ConfigWindow::X(x_pos.into()));
                         }
