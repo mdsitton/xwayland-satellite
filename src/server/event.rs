@@ -340,6 +340,18 @@ impl SurfaceEvents {
             let (scale_factor, window, window_data, role) = query.get().unwrap();
 
             let window = *window;
+            // Where the compositor says this window is, for the toplevel case below.
+            let niri_placed = state.niri.as_ref().and_then(|niri| {
+                let surface = data.get::<&client::wl_surface::WlSurface>()?;
+                let (output, position) = niri.placement_of(surface.id().protocol_id())?;
+                let offset = state.output_position(output)?;
+                Some(
+                    Point::<Logical>::new(position.x as i32, position.y as i32)
+                        .to_physical(scale_factor.0)
+                        .to_root(offset),
+                )
+            });
+
             let (x, y) = match popup {
                 Some((request, parent_origin, parent_scale)) => {
                     // Each axis on its own: one granted as requested restores the X offset it
@@ -367,20 +379,26 @@ impl SurfaceEvents {
                     )
                 }
                 // A toplevel's configure carries no position: the compositor places the window
-                // and X never learns where. Once its client has chosen a position, keep that;
-                // otherwise park the window at its output's origin as before.
-                None if window_data.position_from_client => (
-                    i32::from(window_data.attrs.dims.x),
-                    i32::from(window_data.attrs.dims.y),
-                ),
+                // and X never learns where, unless the compositor tells us separately, which is
+                // then the position to keep. Failing that, keep a position the window's own
+                // client chose, and otherwise park the window at its output's origin as before.
                 None => {
-                    let placed = Point::<Logical>::new(pending.x.max(0), pending.y.max(0))
-                        .to_physical(scale_factor.0)
-                        .to_root(Point::new(
-                            window_data.output_offset.x,
-                            window_data.output_offset.y,
-                        ));
-                    (placed.x, placed.y)
+                    if let Some(placed) = niri_placed {
+                        (placed.x, placed.y)
+                    } else if window_data.position_from_client {
+                        (
+                            i32::from(window_data.attrs.dims.x),
+                            i32::from(window_data.attrs.dims.y),
+                        )
+                    } else {
+                        let placed = Point::<Logical>::new(pending.x.max(0), pending.y.max(0))
+                            .to_physical(scale_factor.0)
+                            .to_root(Point::new(
+                                window_data.output_offset.x,
+                                window_data.output_offset.y,
+                            ));
+                        (placed.x, placed.y)
+                    }
                 }
             };
             let (echoed_width, echoed_height) = popup
