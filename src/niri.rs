@@ -33,9 +33,6 @@ struct Window {
     /// Output the window is on, and where it is on it. Absent for a window that niri doesn't
     /// render anywhere, which is the case for one scrolled out of view.
     placement: Option<(String, Position)>,
-    /// Whether the window is in the floating layout, which is the only one with positions that
-    /// can be asked to change.
-    is_floating: bool,
 }
 
 /// A connection to niri's event stream, tracking where our windows are.
@@ -153,7 +150,6 @@ impl Niri {
                     };
                     let mut entry = previous.remove(&id).unwrap_or_default();
                     entry.surface_id = self.our_surface_id(window);
-                    entry.is_floating = is_floating(window);
                     self.windows.insert(id, entry);
                 }
 
@@ -169,11 +165,9 @@ impl Niri {
                 };
 
                 let surface_id = self.our_surface_id(window);
-                let floating = is_floating(window);
                 let entry = self.windows.entry(id).or_default();
                 let was_ours = entry.surface_id.is_some();
                 entry.surface_id = surface_id;
-                entry.is_floating = floating;
 
                 // A window of ours that just appeared has no placement yet; the geometry event
                 // that follows is what moves it.
@@ -248,54 +242,6 @@ impl Niri {
             .and_then(|window| window.placement.as_ref())
             .map(|(output, position)| (output.as_str(), *position))
     }
-
-    /// The window one of our surfaces belongs to, if it is a floating one that niri is placing,
-    /// together with where it is now.
-    pub(crate) fn floating_window(&self, surface_id: u32) -> Option<(u64, Position)> {
-        self.windows.iter().find_map(|(id, window)| {
-            if window.surface_id != Some(surface_id) || !window.is_floating {
-                return None;
-            }
-            let (_, position) = window.placement.as_ref()?;
-            Some((*id, *position))
-        })
-    }
-
-    /// Asks niri to move a floating window by the given logical distance.
-    ///
-    /// Wayland gives a client no way to place its own windows, so a client that wants to move one
-    /// -- an X client dragging its own window around, say -- can only be served by asking the
-    /// compositor to do it. The move is relative, which saves having to know where niri's working
-    /// area starts.
-    pub(crate) fn move_floating_window(&self, id: u64, dx: f64, dy: f64) {
-        let action = format!(
-            "{{\"Action\":{{\"MoveFloatingWindow\":\
-             {{\"id\":{id},\"x\":{{\"AdjustFixed\":{dx}}},\"y\":{{\"AdjustFixed\":{dy}}}}}}}}}"
-        );
-
-        // A niri request takes a connection of its own, and the reply is of no use to us: there is
-        // nothing to do about a move the compositor declines.
-        if let Err(e) = self.send_request(&action) {
-            debug!("Could not ask niri to move window {id} ({e})");
-        }
-    }
-
-    fn send_request(&self, request: &str) -> std::io::Result<()> {
-        let path = std::env::var_os("NIRI_SOCKET")
-            .ok_or_else(|| std::io::Error::other("NIRI_SOCKET is unset"))?;
-        let mut stream = UnixStream::connect(path)?;
-        stream.write_all(request.as_bytes())?;
-        stream.write_all(b"\n")?;
-        Ok(())
-    }
-}
-
-/// Whether niri reports this window as floating.
-fn is_floating(window: &Value) -> bool {
-    window
-        .get("is_floating")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
 }
 
 impl Window {

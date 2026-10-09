@@ -132,14 +132,6 @@ impl Point<Physical> {
         Self::new(self.x + output.x, self.y + output.y)
     }
 
-    /// This position in logical pixels, for talking to the compositor about it.
-    ///
-    /// The compositor works in fractions of a logical pixel, so this keeps the fraction rather
-    /// than rounding to whole pixels as the conversions towards X do.
-    pub(crate) fn to_logical_f64(self, scale: f64) -> (f64, f64) {
-        (f64::from(self.x) / scale, f64::from(self.y) / scale)
-    }
-
     /// How far this position is from another in the same space.
     pub(crate) fn delta_from(self, origin: Self) -> Self {
         Self::new(self.x - origin.x, self.y - origin.y)
