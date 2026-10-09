@@ -929,16 +929,10 @@ impl Event for client::wl_pointer::Event {
                 // leave X window positions frozen for good.
                 match button_state {
                     WEnum::Value(client::wl_pointer::ButtonState::Pressed) => {
-                        if state.pressed_buttons.insert(button) && state.pressed_buttons.len() == 1
-                        {
-                            state.buttons_held_since = Some(std::time::Instant::now());
-                        }
+                        state.pressed_buttons.insert(button);
                     }
                     _ => {
                         state.pressed_buttons.remove(&button);
-                        if state.pressed_buttons.is_empty() {
-                            state.buttons_held_since = None;
-                        }
                     }
                 }
 
