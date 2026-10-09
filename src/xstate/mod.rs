@@ -491,7 +491,15 @@ impl XState {
                     self.handle_property_change(e, server_state);
                 }
                 xcb::Event::X(x::Event::ConfigureRequest(e)) => {
-                    debug!("{:?} request: {:?}", e.window(), e.value_mask());
+                    debug!(
+                        "{:?} request: {:?} to {}x{} {}x{}",
+                        e.window(),
+                        e.value_mask(),
+                        e.x(),
+                        e.y(),
+                        e.width(),
+                        e.height()
+                    );
 
                     let mut list = Vec::new();
                     let mask = e.value_mask();
