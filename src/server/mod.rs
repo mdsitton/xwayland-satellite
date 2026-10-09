@@ -171,7 +171,11 @@ enum FocusAction {
 ///
 /// Satellite's own titlebar is part of that geometry and sits above the X window, so a position
 /// from the compositor is the titlebar's corner rather than the content's.
-fn decoration_offset(role: &SurfaceRole, dims: WindowDims, scale: f64) -> Point<geometry::Logical> {
+fn decoration_offset(
+    role: &SurfaceRole,
+    dims: WindowDims,
+    scale: f64,
+) -> Point<geometry::Logical> {
     let (origin, _) = popup_anchor(role, dims, scale);
     Point::new(origin.0, origin.1)
 }
@@ -810,10 +814,8 @@ pub struct InnerServerState<S: X11Selection> {
     current_scale: f64,
     /// Where the compositor has put our windows, when it is niri and tells us.
     niri: Option<crate::niri::Niri>,
-    /// Pointer buttons currently held down, and when the first of them went down. While one is
-    /// held an X client may be mid-drag, which window positions and the focus leave undisturbed.
+    /// Pointer buttons currently held down, which is when X window positions stay put.
     pressed_buttons: HashSet<u32>,
-    buttons_held_since: Option<std::time::Instant>,
     /// When a compositor position last changed, while X has not been told yet.
     positions_changed: Option<std::time::Instant>,
 }
@@ -931,7 +933,6 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             world,
             niri: crate::niri::Niri::connect(),
             pressed_buttons: HashSet::new(),
-            buttons_held_since: None,
             positions_changed: None,
         };
         Self {
@@ -956,6 +957,8 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
 impl<C: XConnection> ServerState<C> {
     /// How long the compositor's positions have to hold still before X is told about them.
     const POSITION_QUIET_PERIOD: Duration = Duration::from_millis(100);
+
+
 
     /// The fd that window position updates arrive on, if we are following niri's layout.
     pub fn niri_fd(&self) -> Option<std::os::fd::RawFd> {
@@ -987,8 +990,10 @@ impl<C: XConnection> ServerState<C> {
     pub fn positions_due_in(&self) -> Option<Duration> {
         let changed = self.inner.positions_changed?;
 
-        if let Some(held) = self.inner.pointer_held_for() {
-            return Some(POINTER_HELD_LIMIT.saturating_sub(held));
+        if !self.inner.pressed_buttons.is_empty() {
+            // Holding windows still is for the length of a drag, not indefinitely. A button we
+            // never see released would otherwise strand every window where it stood.
+            return Some(POINTER_HELD_LIMIT.saturating_sub(changed.elapsed()));
         }
 
         Some(Self::POSITION_QUIET_PERIOD.saturating_sub(changed.elapsed()))
@@ -1311,24 +1316,12 @@ impl<C: XConnection> ServerState<C> {
                     None => self.unfocus = true,
                 }
             }
-            // A toplevel the compositor focuses while a pointer button is held -- one a client
-            // opens in the middle of its own drag, as an editor tearing a panel out of a tab bar
-            // does -- must not take X focus from under that drag: a client that loses focus
-            // mid-drag takes it as the drag being cancelled. Leave it queued for the release.
-            //
-            // A popup is the exception. A menu opening under the press is part of the click
-            // being made rather than something stealing focus from it, and it is no use
-            // unfocused.
-            let dragging = self.pointer_held_for().is_some();
-            let hold_focus =
-                dragging && self.to_focus.as_ref().is_some_and(|focus| !focus.is_popup);
-
             if let Some(FocusData {
                 window,
                 output_name,
                 is_popup,
                 action,
-            }) = (!hold_focus).then(|| self.to_focus.take()).flatten()
+            }) = self.to_focus.take()
             {
                 debug!(
                     "focusing {} {window:?} ({action:?})",
@@ -1360,14 +1353,10 @@ impl<C: XConnection> ServerState<C> {
                 if !is_popup && action != FocusAction::None {
                     self.last_focused_toplevel = Some(window);
                 }
-            } else if self.unfocus && !dragging {
-                // Clearing X focus mid-drag ends the drag just as surely as moving it would:
-                // the window being dragged in sees the focus go and gives up.
+            } else if self.unfocus {
                 self.connection.focus_window(x::WINDOW_NONE, None);
             }
-            if !dragging {
-                self.unfocus = false;
-            }
+            self.unfocus = false;
         }
 
         self.handle_selection_events();
@@ -2457,16 +2446,6 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
 }
 
 impl<S: X11Selection> InnerServerState<S> {
-    /// How long a pointer button has been held, while that is still worth respecting.
-    fn pointer_held_for(&self) -> Option<Duration> {
-        if self.pressed_buttons.is_empty() {
-            return None;
-        }
-
-        let held = self.buttons_held_since?.elapsed();
-        (held < POINTER_HELD_LIMIT).then_some(held)
-    }
-
     /// Position of the output a window is on, in X root coordinates.
     fn output_of(&self, window: Entity) -> Option<Point<Physical>> {
         let on_output = self.world.get::<&OnOutput>(window).ok()?.0;
