@@ -167,6 +167,25 @@ enum FocusAction {
     Offer,
 }
 
+/// Where a window's X content sits inside the window geometry the compositor positions.
+///
+/// Satellite's own titlebar is part of that geometry and sits above the X window, so a position
+/// from the compositor is the titlebar's corner rather than the content's.
+fn decoration_offset(
+    role: &SurfaceRole,
+    dims: WindowDims,
+    scale: f64,
+) -> Point<geometry::Logical> {
+    let (origin, _) = popup_anchor(role, dims, scale);
+    Point::new(origin.0, origin.1)
+}
+
+/// How long a held pointer button may hold back window positions and focus changes.
+///
+/// Holding them is for the length of a drag, not indefinitely: a button whose release we never
+/// see -- it can land on a surface that has gone away -- would otherwise freeze both for good.
+const POINTER_HELD_LIMIT: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Default, PartialEq, Eq, Copy, Clone)]
 struct WindowOutputOffset {
     x: i32,
@@ -939,8 +958,7 @@ impl<C: XConnection> ServerState<C> {
     /// How long the compositor's positions have to hold still before X is told about them.
     const POSITION_QUIET_PERIOD: Duration = Duration::from_millis(100);
 
-    /// How long a held pointer button may keep X window positions from being updated.
-    const POSITION_HELD_LIMIT: Duration = Duration::from_secs(2);
+
 
     /// The fd that window position updates arrive on, if we are following niri's layout.
     pub fn niri_fd(&self) -> Option<std::os::fd::RawFd> {
@@ -974,10 +992,8 @@ impl<C: XConnection> ServerState<C> {
 
         if !self.inner.pressed_buttons.is_empty() {
             // Holding windows still is for the length of a drag, not indefinitely. A button we
-            // never see released -- the release landing on a surface that has gone away, say --
-            // would otherwise strand every window where it stood.
-            let held = Self::POSITION_HELD_LIMIT.saturating_sub(changed.elapsed());
-            return Some(held);
+            // never see released would otherwise strand every window where it stood.
+            return Some(POINTER_HELD_LIMIT.saturating_sub(changed.elapsed()));
         }
 
         Some(Self::POSITION_QUIET_PERIOD.saturating_sub(changed.elapsed()))
@@ -1101,9 +1117,15 @@ impl<C: XConnection> ServerState<C> {
                     continue;
                 };
 
-                let placed = Point::<geometry::Logical>::new(position.x as i32, position.y as i32)
-                    .to_physical(scale.0)
-                    .to_root(offset);
+                // The compositor positions the whole window geometry, which includes a titlebar
+                // satellite draws itself; the X window is only the content below it.
+                let content = decoration_offset(role, data.attrs.dims, scale.0);
+                let placed = Point::<geometry::Logical>::new(
+                    position.x as i32 + content.x,
+                    position.y as i32 + content.y,
+                )
+                .to_physical(scale.0)
+                .to_root(offset);
                 let (x, y) = placed.to_x();
                 if (x, y) == (data.attrs.dims.x, data.attrs.dims.y) {
                     continue;

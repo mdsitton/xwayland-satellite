@@ -1,5 +1,6 @@
 use super::clientside::LateInitObjectKey;
 use super::decoration::DecorationMarker;
+use super::decoration_offset;
 use super::geometry::{Logical, Physical, Point, Size};
 use super::*;
 use hecs::{CommandBuffer, World};
@@ -345,8 +346,13 @@ impl SurfaceEvents {
                 let surface = data.get::<&client::wl_surface::WlSurface>()?;
                 let (output, position) = niri.placement_of(surface.id().protocol_id())?;
                 let offset = state.output_position(output)?;
+                // The position is of the whole window geometry; the X window is the content
+                // below any titlebar satellite draws for it.
+                let role = data.get::<&SurfaceRole>()?;
+                let content = decoration_offset(&role, window_data.attrs.dims, scale_factor.0);
+                drop(role);
                 Some(
-                    Point::<Logical>::new(position.x as i32, position.y as i32)
+                    Point::<Logical>::new(position.x as i32 + content.x, position.y as i32 + content.y)
                         .to_physical(scale_factor.0)
                         .to_root(offset),
                 )
