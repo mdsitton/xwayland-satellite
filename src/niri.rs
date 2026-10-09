@@ -58,7 +58,9 @@ impl Niri {
         let mut stream = match UnixStream::connect(&path) {
             Ok(stream) => stream,
             Err(e) => {
-                warn!("Could not connect to niri at {path:?} ({e}); X windows will not be told where they are");
+                warn!(
+                    "Could not connect to niri at {path:?} ({e}); X windows will not be told where they are"
+                );
                 return None;
             }
         };
@@ -181,7 +183,9 @@ impl Niri {
                 let Some(id) = data.get("id").and_then(Value::as_u64) else {
                     return false;
                 };
-                self.windows.remove(&id).is_some_and(|window| window.is_ours())
+                self.windows
+                    .remove(&id)
+                    .is_some_and(|window| window.is_ours())
             }
             "WindowGeometriesChanged" => {
                 let changes = data.get("changes").and_then(Value::as_array);
