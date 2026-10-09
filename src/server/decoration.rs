@@ -43,6 +43,12 @@ pub struct DecorationsDataSatellite {
     title: Option<String>,
     title_rect: Rect,
     should_draw: bool,
+    /// Whether the titlebar was last committed in synchronized mode and the parent has not
+    /// committed since, i.e. the compositor is still holding that titlebar state back.
+    awaiting_parent_commit: bool,
+    /// What the titlebar was last drawn for: width, scale bits and title. A redraw for the
+    /// same values is skipped.
+    last_drawn: Option<(i32, u32, Option<String>)>,
     remove_buffer: bool,
 }
 
@@ -104,6 +110,8 @@ impl DecorationsDataSatellite {
                 title_rect: Rect::from_ltrb(0.0, 0.0, 0.0, 0.0).unwrap(),
                 should_draw: true,
                 remove_buffer: false,
+                awaiting_parent_commit: false,
+                last_drawn: None,
             }
             .into(),
             new_pool.map(|p| {
@@ -118,7 +126,39 @@ impl DecorationsDataSatellite {
         world.get::<&mut SlotPool>(self.pool).unwrap()
     }
 
-    fn update_buffer(&mut self, world: &World) {
+    /// Commits the titlebar together with the parent's next commit. Used for changes that must
+    /// stay in step with the X window, such as a resize (#268). The titlebar's new geometry
+    /// (pixmap, viewport) is prepared before the upload and would be applied by any later
+    /// commit, so it must wait for the parent whether or not this upload succeeded.
+    fn update_buffer(&mut self, world: &World) -> bool {
+        self.awaiting_parent_commit = true;
+        self.update_buffer_inner(world)
+    }
+
+    /// Commits the titlebar on its own, for changes the parent will not repaint for, such as
+    /// the close button's hover state. A sub-surface is synchronized by default, so its commits
+    /// are only applied with the parent's; an X client that has nothing to repaint would leave
+    /// the change unapplied indefinitely. Switch to desynchronized mode for the commit, unless
+    /// a synchronized commit is still waiting on the parent, in which case that commit must
+    /// not be applied early and this change simply joins it.
+    fn update_buffer_independently(&mut self, world: &World) -> bool {
+        if self.awaiting_parent_commit {
+            return self.update_buffer_inner(world);
+        }
+        self.subsurface.set_desync();
+        let uploaded = self.update_buffer_inner(world);
+        self.subsurface.set_sync();
+        uploaded
+    }
+
+    /// The parent surface committed, applying whatever titlebar state was cached with it.
+    pub fn parent_committed(&mut self) {
+        self.awaiting_parent_commit = false;
+    }
+
+    /// Uploads the pixmap and commits it. Returns whether that happened; a failed upload leaves
+    /// the previous buffer in place and nothing pending.
+    fn update_buffer_inner(&mut self, world: &World) -> bool {
         let mut pool = self.pool(world);
         let (buffer, data) = match pool.create_buffer(
             self.pixmap.width() as i32,
@@ -129,13 +169,14 @@ impl DecorationsDataSatellite {
             Ok(b) => b,
             Err(err) => {
                 error!("Failed to create buffer for decorations: {err:?}");
-                return;
+                return false;
             }
         };
 
         draw_pixmap_to_buffer(&self.pixmap, data);
         buffer.attach_to(&self.surface).unwrap();
         self.surface.commit();
+        true
     }
 
     #[must_use]
@@ -148,8 +189,19 @@ impl DecorationsDataSatellite {
             if self.remove_buffer {
                 self.surface.attach(None, 0, 0);
                 self.surface.commit();
+                self.awaiting_parent_commit = true;
                 self.remove_buffer = false;
             }
+            self.last_drawn = None;
+            return;
+        }
+
+        // The viewport is recomputed for events that need not change the titlebar, such as
+        // entering an output at the same scale. A synchronized recommit of the same content
+        // would wait for a parent commit that an idle client never makes, and hold back the
+        // independent redraws behind it (see update_buffer_independently).
+        let drawn = (width, parent_scale_factor.to_bits(), self.title.clone());
+        if self.last_drawn.as_ref() == Some(&drawn) {
             return;
         }
 
@@ -209,10 +261,15 @@ impl DecorationsDataSatellite {
 
         self.pixmap = bar;
         self.viewport.set_destination(width, Self::TITLEBAR_HEIGHT);
-        self.update_buffer(world);
+        // Only a titlebar that was actually uploaded counts as drawn; otherwise the next
+        // request for the same values must try again.
+        self.last_drawn = self.update_buffer(world).then_some(drawn);
     }
 
     fn redraw_x_pixmap(&mut self, world: &World) {
+        if !self.should_draw {
+            return;
+        }
         let x = x_pixmap(self.pixmap.height(), self.scale, self.x_data.hovered);
 
         self.pixmap.draw_pixmap(
@@ -230,7 +287,7 @@ impl DecorationsDataSatellite {
             x.width() as i32,
             x.height() as i32,
         );
-        self.update_buffer(world);
+        self.update_buffer_independently(world);
     }
 
     pub fn set_title(&mut self, world: &World, title: &str) {
@@ -271,19 +328,28 @@ impl DecorationsDataSatellite {
             );
         }
 
-        let damaged_width = last_title_rect
-            .width()
-            .max(title_pixmap.map(|p| p.width() as f32).unwrap_or(0.0));
+        // Both titles start at the origin, so their union is the larger of each extent.
+        let damaged_width = last_title_rect.width().max(new_title_rect.width());
+        let damaged_height = last_title_rect.height().max(new_title_rect.height());
 
         self.surface
-            .damage_buffer(0, 0, damaged_width as i32, last_title_rect.height() as i32);
-        self.update_buffer(world);
+            .damage_buffer(0, 0, damaged_width as i32, damaged_height as i32);
+        if self.update_buffer_independently(world) {
+            if let Some(drawn) = self.last_drawn.as_mut() {
+                drawn.2 = self.title.clone();
+            }
+        } else {
+            self.last_drawn = None;
+        }
     }
 
     pub fn handle_fullscreen(&mut self, fullscreen: bool) {
         if self.should_draw == fullscreen {
             self.should_draw = !fullscreen;
             self.remove_buffer = fullscreen;
+            if fullscreen {
+                self.x_data.hovered = false;
+            }
         }
     }
 
