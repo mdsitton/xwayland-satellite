@@ -1,5 +1,6 @@
 use super::clientside::LateInitObjectKey;
 use super::decoration::DecorationMarker;
+use super::geometry::{Logical, Physical, Size};
 use super::*;
 use hecs::{CommandBuffer, World};
 use log::{debug, error, trace, warn};
@@ -381,7 +382,10 @@ impl SurfaceEvents {
             let width = if let Some(width) = echoed_width {
                 width
             } else if pending.width > 0 {
-                (pending.width as f64 * scale_factor.0) as u16
+                Size::<Logical>::new(pending.width, 0)
+                    .to_physical(scale_factor.0)
+                    .to_x()
+                    .0
             } else {
                 window_data.attrs.dims.width
             };
@@ -399,7 +403,10 @@ impl SurfaceEvents {
                         }
                     }
                 }
-                (logical_height as f64 * scale_factor.0) as u16
+                Size::<Logical>::new(0, logical_height)
+                    .to_physical(scale_factor.0)
+                    .to_x()
+                    .1
             } else {
                 window_data.attrs.dims.height
             };
@@ -590,10 +597,8 @@ impl SurfaceEvents {
 /// surface, so both must derive their logical size this way or they disagree at fractional
 /// scales.
 pub(super) fn logical_size(width: u16, height: u16, scale: f64) -> (i32, i32) {
-    (
-        (width as f64 / scale).ceil() as i32,
-        (height as f64 / scale).ceil() as i32,
-    )
+    let logical = Size::from_x(width, height).to_logical(scale);
+    (logical.width, logical.height)
 }
 
 pub(super) fn update_surface_viewport(
@@ -610,7 +615,8 @@ pub(super) fn update_surface_viewport(
     let dims = &window_data.attrs.dims;
     let size_hints = &window_data.attrs.size_hints;
 
-    let (width, height) = logical_size(dims.width, dims.height, scale_factor.0);
+    let logical = Size::from_x(dims.width, dims.height).to_logical(scale_factor.0);
+    let (width, height) = (logical.width, logical.height);
     if width > 0 && height > 0 {
         viewport.set_destination(width, height);
     }
@@ -642,16 +648,26 @@ pub(super) fn update_size_hints(data: &ToplevelData, hints: &WmNormalHints, scal
     };
     if let Some(min_size) = &hints.min_size {
         data.toplevel.set_min_size(
-            (min_size.width as f64 / scale) as i32,
-            ((min_size.height as f64 / scale) as i32).saturating_add(decorations_height),
+            Size::<Physical>::new(min_size.width, min_size.height)
+                .to_logical_bound(scale)
+                .width,
+            Size::<Physical>::new(min_size.width, min_size.height)
+                .to_logical_bound(scale)
+                .height
+                .saturating_add(decorations_height),
         );
     } else {
         data.toplevel.set_min_size(0, 0);
     }
     if let Some(max_size) = &hints.max_size {
         data.toplevel.set_max_size(
-            (max_size.width as f64 / scale) as i32,
-            ((max_size.height as f64 / scale) as i32).saturating_add(decorations_height),
+            Size::<Physical>::new(max_size.width, max_size.height)
+                .to_logical_bound(scale)
+                .width,
+            Size::<Physical>::new(max_size.width, max_size.height)
+                .to_logical_bound(scale)
+                .height
+                .saturating_add(decorations_height),
         );
     } else {
         data.toplevel.set_max_size(0, 0);

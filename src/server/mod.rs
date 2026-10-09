@@ -2,6 +2,7 @@ mod clientside;
 mod decoration;
 mod dispatch;
 mod event;
+mod geometry;
 pub(crate) mod selection;
 #[cfg(test)]
 mod tests;
