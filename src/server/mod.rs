@@ -184,6 +184,8 @@ struct WindowData {
     /// back would make the client request that position again, adding the offset a second
     /// time, until the window walks off the screen and X stops delivering it any input.
     position_from_client: bool,
+    /// The compositor has told us where this window is, and X has been told in turn.
+    position_from_compositor: bool,
     activation_token: Option<String>,
 }
 
@@ -194,6 +196,7 @@ impl WindowData {
         let position_from_client = (dims.x, dims.y) != (0, 0);
         Self {
             mapped: false,
+            position_from_compositor: false,
             attrs: WindowAttributes {
                 role: WindowRole::new_basic(override_redirect),
                 override_redirect,
@@ -936,6 +939,9 @@ impl<C: XConnection> ServerState<C> {
     /// How long the compositor's positions have to hold still before X is told about them.
     const POSITION_QUIET_PERIOD: Duration = Duration::from_millis(100);
 
+    /// How long a held pointer button may keep X window positions from being updated.
+    const POSITION_HELD_LIMIT: Duration = Duration::from_secs(2);
+
     /// The fd that window position updates arrive on, if we are following niri's layout.
     pub fn niri_fd(&self) -> Option<std::os::fd::RawFd> {
         use std::os::fd::AsRawFd;
@@ -951,6 +957,7 @@ impl<C: XConnection> ServerState<C> {
 
         if moved {
             self.inner.positions_changed = Some(std::time::Instant::now());
+            self.update_window_positions_for(true);
         }
         self.update_window_positions_if_due();
     }
@@ -960,11 +967,16 @@ impl<C: XConnection> ServerState<C> {
     /// `None` means nothing is pending, or that it waits on something other than time: while a
     /// pointer button is held, the windows stay where they are until it is released.
     pub fn positions_due_in(&self) -> Option<Duration> {
+        let changed = self.inner.positions_changed?;
+
         if !self.inner.pressed_buttons.is_empty() {
-            return None;
+            // Holding windows still is for the length of a drag, not indefinitely. A button we
+            // never see released -- the release landing on a surface that has gone away, say --
+            // would otherwise strand every window where it stood.
+            let held = Self::POSITION_HELD_LIMIT.saturating_sub(changed.elapsed());
+            return Some(held);
         }
 
-        let changed = self.inner.positions_changed?;
         Some(Self::POSITION_QUIET_PERIOD.saturating_sub(changed.elapsed()))
     }
 
@@ -985,14 +997,24 @@ impl<C: XConnection> ServerState<C> {
         }
 
         self.inner.positions_changed = None;
-        self.update_window_positions();
+        self.update_window_positions_for(false);
+    }
+
+    /// Puts toplevels where the compositor says they are.
+    ///
+    /// While a pointer button is held only windows that have never been placed are moved: a
+    /// window that appears mid-drag, which is what a drag preview is, has no position anyone
+    /// could have taken note of, and leaving it at its output's origin until the button comes up
+    /// puts it somewhere the client never asked for.
+    fn update_window_positions_for(&mut self, only_new: bool) {
+        self.update_window_positions_inner(only_new);
     }
 
     /// Puts every toplevel where the compositor says it is.
     ///
     /// X clients work out what the pointer is over from these positions, so they have to match
     /// what is on screen, not just be distinct from each other.
-    fn update_window_positions(&mut self) {
+    fn update_window_positions_inner(&mut self, only_new: bool) {
         let Some(niri) = &self.inner.niri else {
             return;
         };
@@ -1009,6 +1031,9 @@ impl<C: XConnection> ServerState<C> {
 
             for (entity, (window, data, role, scale, surface)) in query.into_iter() {
                 if !data.mapped || !matches!(role, SurfaceRole::Toplevel(_)) {
+                    continue;
+                }
+                if only_new && data.position_from_compositor {
                     continue;
                 }
 
@@ -1046,6 +1071,7 @@ impl<C: XConnection> ServerState<C> {
             // The compositor decides where the window goes, so its own idea of a position is no
             // longer something to preserve.
             data.position_from_client = false;
+            data.position_from_compositor = true;
             let dims = PendingSurfaceState {
                 x: x.into(),
                 y: y.into(),
