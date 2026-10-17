@@ -171,11 +171,7 @@ enum FocusAction {
 ///
 /// Satellite's own titlebar is part of that geometry and sits above the X window, so a position
 /// from the compositor is the titlebar's corner rather than the content's.
-fn decoration_offset(
-    role: &SurfaceRole,
-    dims: WindowDims,
-    scale: f64,
-) -> Point<geometry::Logical> {
+fn decoration_offset(role: &SurfaceRole, dims: WindowDims, scale: f64) -> Point<geometry::Logical> {
     let (origin, _) = popup_anchor(role, dims, scale);
     Point::new(origin.0, origin.1)
 }
@@ -958,8 +954,6 @@ impl<C: XConnection> ServerState<C> {
     /// How long the compositor's positions have to hold still before X is told about them.
     const POSITION_QUIET_PERIOD: Duration = Duration::from_millis(100);
 
-
-
     /// The fd that window position updates arrive on, if we are following niri's layout.
     pub fn niri_fd(&self) -> Option<std::os::fd::RawFd> {
         use std::os::fd::AsRawFd;
@@ -987,6 +981,11 @@ impl<C: XConnection> ServerState<C> {
     ///
     /// `None` means nothing is pending, or that it waits on something other than time: while a
     /// pointer button is held, the windows stay where they are until it is released.
+    /// How long until the compositor connection is worth retrying, if it dropped.
+    pub fn niri_retry_in(&self) -> Option<Duration> {
+        self.inner.niri.as_ref().and_then(|niri| niri.retry_in())
+    }
+
     pub fn positions_due_in(&self) -> Option<Duration> {
         let changed = self.inner.positions_changed?;
 

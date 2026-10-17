@@ -11,12 +11,17 @@
 //! that doesn't report surface ids, satellite behaves as it did before.
 
 use std::collections::HashMap;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
 use serde_json::Value;
+
+/// How long to wait before trying the compositor again after the stream drops.
+const RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// Where niri says a window is, in the logical coordinates of its output.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -40,88 +45,145 @@ struct Window {
 
 /// A connection to niri's event stream, tracking where our windows are.
 pub(crate) struct Niri {
-    stream: UnixStream,
-    /// Bytes of an event that hasn't arrived in full yet.
-    pending: Vec<u8>,
+    /// Events from niri, read by a thread of their own.
+    ///
+    /// niri drops a client that falls behind its event buffer, and satellite's own loop waits on
+    /// the X server often enough to do so. Reading on a thread keeps the compositor's view of us
+    /// independent of what the X server is doing.
+    events: Option<Receiver<Vec<u8>>>,
+    /// Becomes readable when the reader has events waiting, so that the poll loop wakes for them.
+    wake: UnixStream,
+    /// The writing end, handed to each reader.
+    waker: UnixStream,
+    /// When to try connecting again, once the stream has dropped.
+    retry_at: Option<Instant>,
     /// Our own process id, which is the one niri reports for every window we create.
     pid: i32,
     windows: HashMap<u64, Window>,
-    /// Set once niri stops talking to us, after which we leave X positions alone.
-    done: bool,
 }
 
 impl Niri {
     /// Subscribes to niri's event stream, if we are running under niri.
     pub(crate) fn connect() -> Option<Self> {
-        let path = std::env::var_os("NIRI_SOCKET")?;
+        // Not running under niri at all is the one case worth giving up on: everything else is
+        // worth another try, since the compositor outlives any one connection to it.
+        std::env::var_os("NIRI_SOCKET")?;
 
-        let mut stream = match UnixStream::connect(&path) {
-            Ok(stream) => stream,
+        let (wake, waker) = match UnixStream::pair() {
+            Ok(pair) => pair,
             Err(e) => {
                 warn!(
-                    "Could not connect to niri at {path:?} ({e}); X windows will not be told where they are"
+                    "Could not make a wakeup pipe ({e}); X windows will not be told where they are"
                 );
                 return None;
             }
         };
-
-        // The reply to this is a line of its own, which parsing skips like any other event we
-        // don't handle.
-        if let Err(e) = stream.write_all(b"\"EventStream\"\n") {
-            warn!("Could not subscribe to niri's event stream ({e})");
+        if let Err(e) = wake.set_nonblocking(true) {
+            warn!("Could not make the wakeup pipe nonblocking ({e})");
             return None;
         }
 
-        if let Err(e) = stream.set_nonblocking(true) {
-            warn!("Could not make the niri socket nonblocking ({e})");
-            return None;
+        let mut niri = Self {
+            events: None,
+            wake,
+            waker,
+            retry_at: Some(Instant::now()),
+            pid: std::process::id() as i32,
+            windows: HashMap::new(),
+        };
+        niri.reconnect();
+        Some(niri)
+    }
+
+    /// The fd that goes readable when there are events to take in.
+    pub(crate) fn as_fd(&self) -> BorrowedFd<'_> {
+        self.wake.as_fd()
+    }
+
+    /// Starts a reader for a fresh connection, if one is due.
+    fn reconnect(&mut self) {
+        if self.events.is_some() || self.retry_at.is_some_and(|at| at > Instant::now()) {
+            return;
+        }
+        self.retry_at = None;
+
+        let Some(path) = std::env::var_os("NIRI_SOCKET") else {
+            return;
+        };
+
+        let mut stream = match UnixStream::connect(&path) {
+            Ok(stream) => stream,
+            Err(e) => {
+                debug!("Could not connect to niri at {path:?} ({e}); trying again shortly");
+                self.retry_at = Some(Instant::now() + RETRY_DELAY);
+                return;
+            }
+        };
+
+        // The reply to this is a line of its own, which parsing skips like any other event we
+        // don't handle. Everything niri knows follows it, so the windows we knew about before
+        // are described again and the map can start empty.
+        if let Err(e) = stream.write_all(b"\"EventStream\"\n") {
+            warn!("Could not subscribe to niri's event stream ({e}); trying again shortly");
+            self.retry_at = Some(Instant::now() + RETRY_DELAY);
+            return;
+        }
+
+        let Ok(waker) = self.waker.try_clone() else {
+            warn!("Could not clone the wakeup pipe; X windows will not be told where they are");
+            return;
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("niri events".to_owned())
+            .spawn(move || read_events_forever(stream, tx, waker));
+        if let Err(e) = spawned {
+            warn!("Could not start a reader for niri's events ({e}); trying again shortly");
+            self.retry_at = Some(Instant::now() + RETRY_DELAY);
+            return;
         }
 
         info!("Following window positions from niri at {path:?}");
-        Some(Self {
-            stream,
-            pending: Vec::new(),
-            pid: std::process::id() as i32,
-            windows: HashMap::new(),
-            done: false,
-        })
+        self.windows.clear();
+        self.events = Some(rx);
     }
 
-    pub(crate) fn as_fd(&self) -> BorrowedFd<'_> {
-        self.stream.as_fd()
+    /// How long until the connection is worth trying again, if it is waiting to be.
+    pub(crate) fn retry_in(&self) -> Option<Duration> {
+        let at = self.retry_at?;
+        Some(at.saturating_duration_since(Instant::now()))
     }
 
-    /// Reads whatever niri has sent us, returning true if any window moved.
+    /// Takes in whatever niri has sent us, returning true if any window moved.
     pub(crate) fn read_events(&mut self) -> bool {
-        if self.done {
-            return false;
-        }
+        self.reconnect();
 
-        let mut buf = [0u8; 8192];
-        loop {
-            match self.stream.read(&mut buf) {
-                Ok(0) => {
-                    warn!("niri closed its event stream; X windows will keep their positions");
-                    self.done = true;
-                    break;
-                }
-                Ok(n) => self.pending.extend_from_slice(&buf[..n]),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    warn!("Reading from niri failed ({e}); X windows will keep their positions");
-                    self.done = true;
-                    break;
-                }
+        // Whatever woke us has been noted; the events themselves come from the reader.
+        let mut scratch = [0u8; 256];
+        while let Ok(n) = (&self.wake).read(&mut scratch) {
+            if n == 0 {
+                break;
             }
         }
 
         let mut moved = false;
-        while let Some(end) = self.pending.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.pending.drain(..=end).collect();
-            moved |= self.handle_event(&line[..end]);
+        loop {
+            let Some(events) = &self.events else {
+                return moved;
+            };
+
+            match events.try_recv() {
+                Ok(line) => moved |= self.handle_event(&line),
+                Err(TryRecvError::Empty) => return moved,
+                Err(TryRecvError::Disconnected) => {
+                    warn!("niri stopped sending events; reconnecting shortly");
+                    self.events = None;
+                    self.retry_at = Some(Instant::now() + RETRY_DELAY);
+                    return moved;
+                }
+            }
         }
-        moved
     }
 
     /// Takes in one event, returning true if it moved any window.
@@ -283,6 +345,38 @@ impl Niri {
         stream.write_all(request.as_bytes())?;
         stream.write_all(b"\n")?;
         Ok(())
+    }
+}
+
+/// Reads events until the connection ends, handing each line to the main thread.
+fn read_events_forever(
+    stream: UnixStream,
+    tx: std::sync::mpsc::Sender<Vec<u8>>,
+    mut waker: UnixStream,
+) {
+    let mut reader = BufReader::new(stream);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                while line.last() == Some(&b'\n') || line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                if tx.send(std::mem::take(&mut line)).is_err() {
+                    break;
+                }
+                // Any byte will do: the main loop only needs to know to come and look.
+                if let Err(e) = waker.write_all(b"n") {
+                    if e.kind() != ErrorKind::WouldBlock {
+                        break;
+                    }
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
     }
 }
 

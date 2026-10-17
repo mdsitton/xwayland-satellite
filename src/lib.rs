@@ -266,6 +266,9 @@ pub fn main(mut data: impl RunData) -> Option<()> {
         // happens in the meantime.
         let timeout = server_state
             .positions_due_in()
+            .into_iter()
+            .chain(server_state.niri_retry_in())
+            .min()
             .map(|due| timespec_from_millis(due.as_millis() as u64));
 
         match poll(&mut fds, timeout.as_ref()) {
