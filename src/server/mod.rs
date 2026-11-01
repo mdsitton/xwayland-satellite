@@ -224,6 +224,33 @@ impl WindowData {
         }
     }
 
+    /// The compositor has this window at `position`, on the output at `output`. Its position is
+    /// in that output's frame, whatever frame it was in before, so the offset has to say so:
+    /// popups take their parent's frame, and read a position with its offset.
+    ///
+    /// Returns how far that moved the window and its frame.
+    fn place_by_compositor(
+        &mut self,
+        position: Point<Physical>,
+        output: Point<Physical>,
+    ) -> (Point<Physical>, Point<Physical>) {
+        let dims = &mut self.attrs.dims;
+        let by = position.delta_from(Point::from_x(dims.x, dims.y));
+        // X positions are 16-bit, and a window anchored to one that scrolled far out of view can
+        // be well past that, so take the clamped position.
+        (dims.x, dims.y) = position.to_x();
+        let frame_by = output.delta_from(Point::new(self.output_offset.x, self.output_offset.y));
+        self.output_offset = WindowOutputOffset {
+            x: output.x,
+            y: output.y,
+        };
+        // The compositor decides where the window goes, so its client's idea of a position is no
+        // longer something to preserve.
+        self.position_from_client = false;
+        self.position_from_compositor = true;
+        (by, frame_by)
+    }
+
     /// Moves the window along with its output. A position queued for X by a configure that
     /// has not been applied yet was derived from the old offset, and is moved as well.
     fn update_output_offset<C: XConnection>(
@@ -1130,25 +1157,18 @@ impl<C: XConnection> ServerState<C> {
                     continue;
                 }
 
-                moves.push((entity, *window, placed));
+                moves.push((entity, *window, placed, offset));
             }
         }
 
         let mut moved = 0usize;
-        for (entity, window, placed) in moves {
+        for (entity, window, placed, output) in moves {
             let Ok(mut data) = self.inner.world.get::<&mut WindowData>(entity) else {
                 continue;
             };
 
-            // X positions are 16-bit, and a window anchored to one that scrolled far out of
-            // view can be well past that, so take the clamped position for both.
-            let (x, y) = placed.to_x();
-            data.attrs.dims.x = x;
-            data.attrs.dims.y = y;
-            // The compositor decides where the window goes, so its own idea of a position is no
-            // longer something to preserve.
-            data.position_from_client = false;
-            data.position_from_compositor = true;
+            let (by, frame_by) = data.place_by_compositor(placed, output);
+            let (x, y) = (data.attrs.dims.x, data.attrs.dims.y);
             let dims = PendingSurfaceState {
                 x: x.into(),
                 y: y.into(),
@@ -1162,6 +1182,7 @@ impl<C: XConnection> ServerState<C> {
                 dims.x, dims.y
             );
             self.connection.set_window_dims(window, dims);
+            self.move_child_popups(entity, by, frame_by);
             moved += 1;
         }
 
@@ -2250,6 +2271,76 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                 wl: wl_decoration,
                 satellite: sat_decoration,
             },
+        }
+    }
+
+    /// Takes a window's popups along with it, in X as they already are on screen, when the
+    /// compositor moved it. Left behind, their X position says they are somewhere else relative
+    /// to the window, which the next re-anchor would act on.
+    fn move_child_popups(
+        &mut self,
+        parent: Entity,
+        by: Point<Physical>,
+        frame_by: Point<Physical>,
+    ) {
+        let mut parents = vec![parent];
+        while let Some(parent) = parents.pop() {
+            let children: Vec<Entity> = self
+                .world
+                .query::<&SurfaceRole>()
+                .iter()
+                .filter_map(|(entity, role)| match role {
+                    SurfaceRole::Popup(Some(popup)) if popup.parent == parent => Some(entity),
+                    _ => None,
+                })
+                .collect();
+
+            for entity in children {
+                parents.push(entity);
+                let Ok((data, role, pending)) = self.world.query_one_mut::<(
+                    &mut WindowData,
+                    &mut SurfaceRole,
+                    Option<&mut PendingSurfaceState>,
+                )>(entity) else {
+                    continue;
+                };
+
+                let dims = &mut data.attrs.dims;
+                (dims.x, dims.y) = Point::from_x(dims.x, dims.y).to_root(by).to_x();
+                data.output_offset.x += frame_by.x;
+                data.output_offset.y += frame_by.y;
+                // A popup shares its parent's frame, which is the compositor's now.
+                data.position_from_client = false;
+                let dims = data.attrs.dims;
+                if let SurfaceRole::Popup(Some(PopupData {
+                    client_geometry: Some(geometry),
+                    ..
+                })) = role
+                {
+                    let dims = &mut geometry.dims;
+                    (dims.x, dims.y) = Point::from_x(dims.x, dims.y).to_root(by).to_x();
+                    geometry.offset.x += frame_by.x;
+                    geometry.offset.y += frame_by.y;
+                }
+
+                // X hears of it with the next batch of window positions.
+                if let Some(pending) = pending {
+                    pending.x += by.x;
+                    pending.y += by.y;
+                } else if by != Point::new(0, 0) {
+                    self.world
+                        .insert_one(
+                            entity,
+                            PendingSurfaceState {
+                                x: dims.x.into(),
+                                y: dims.y.into(),
+                                width: dims.width.into(),
+                                height: dims.height.into(),
+                            },
+                        )
+                        .unwrap();
+                }
+            }
         }
     }
 

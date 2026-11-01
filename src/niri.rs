@@ -95,6 +95,29 @@ impl Niri {
         Some(niri)
     }
 
+    /// A connection that reports one window of ours where the test says it is.
+    #[cfg(test)]
+    pub(crate) fn with_placement(surface_id: u32, output: &str, position: Position) -> Self {
+        let (wake, waker) = UnixStream::pair().unwrap();
+        let mut niri = Self {
+            events: None,
+            wake,
+            waker,
+            retry_at: None,
+            pid: std::process::id() as i32,
+            windows: HashMap::new(),
+        };
+        niri.windows.insert(
+            1,
+            Window {
+                surface_id: Some(surface_id),
+                placement: Some((output.to_owned(), position)),
+                is_floating: false,
+            },
+        );
+        niri
+    }
+
     /// The fd that goes readable when there are events to take in.
     pub(crate) fn as_fd(&self) -> BorrowedFd<'_> {
         self.wake.as_fd()

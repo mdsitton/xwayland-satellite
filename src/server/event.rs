@@ -351,11 +351,15 @@ impl SurfaceEvents {
                 let role = data.get::<&SurfaceRole>()?;
                 let content = decoration_offset(&role, window_data.attrs.dims, scale_factor.0);
                 drop(role);
-                Some(
-                    Point::<Logical>::new(position.x as i32 + content.x, position.y as i32 + content.y)
-                        .to_physical(scale_factor.0)
-                        .to_root(offset),
-                )
+                Some((
+                    Point::<Logical>::new(
+                        position.x as i32 + content.x,
+                        position.y as i32 + content.y,
+                    )
+                    .to_physical(scale_factor.0)
+                    .to_root(offset),
+                    offset,
+                ))
             });
 
             let (x, y) = match popup {
@@ -389,7 +393,7 @@ impl SurfaceEvents {
                 // then the position to keep. Failing that, keep a position the window's own
                 // client chose, and otherwise park the window at its output's origin as before.
                 None => {
-                    if let Some(placed) = niri_placed {
+                    if let Some((placed, _)) = niri_placed {
                         (placed.x, placed.y)
                     } else if window_data.position_from_client {
                         (
@@ -451,6 +455,9 @@ impl SurfaceEvents {
                 data.get::<&WlSurface>().unwrap().id(),
             );
 
+            let parent_moved = niri_placed
+                .filter(|_| popup.is_none())
+                .map(|(placed, output)| window_data.place_by_compositor(placed, output));
             window_data.attrs.dims = WindowDims {
                 x: x as i16,
                 y: y as i16,
@@ -475,6 +482,9 @@ impl SurfaceEvents {
             }
             state.world.insert_one(target, pending).unwrap();
             update_surface_viewport(&state.world, state.world.query_one(target).unwrap());
+            if let Some((by, frame_by)) = parent_moved {
+                state.move_child_popups(target, by, frame_by);
+            }
             if is_toplevel {
                 state.refresh_child_popups(target, Some(serial));
             }

@@ -5619,3 +5619,135 @@ fn output_mode_change_scaled() {
         check_xdg_logical_size(&output_xdg, &output_obj, (width, height));
     }
 }
+
+/// Reports a toplevel at this position on the output at the given X offset, as niri would.
+fn place_with_niri(
+    f: &mut TestFixture<FakeXConnection>,
+    window: Window,
+    output_x: i32,
+    position: (f64, f64),
+) {
+    let entity = f.satellite.inner.windows[&window];
+    let surface_id = f
+        .satellite
+        .inner
+        .world
+        .get::<&wayland_client::protocol::wl_surface::WlSurface>(entity)
+        .unwrap()
+        .id()
+        .protocol_id();
+    let output = f
+        .satellite
+        .inner
+        .world
+        .query::<(&super::event::OutputName, &super::event::OutputDimensions)>()
+        .iter()
+        .find(|(_, (_, dimensions))| dimensions.x == output_x)
+        .map(|(_, (name, _))| name.0.clone())
+        .unwrap();
+    f.satellite.inner.niri = Some(crate::niri::Niri::with_placement(
+        surface_id,
+        &output,
+        crate::niri::Position {
+            x: position.0,
+            y: position.1,
+        },
+    ));
+}
+
+/// A toplevel on the output at x = 500, which its client moved before the compositor placed it.
+fn toplevel_placed_by_niri_after_client_move(
+    f: &mut TestFixture<FakeXConnection>,
+    comp: &Compositor,
+    window: Window,
+) -> (
+    testwl::SurfaceId,
+    wayland_server::protocol::wl_output::WlOutput,
+) {
+    f.new_output(0, 0);
+    let (_, output) = f.new_output(500, 0);
+    f.run();
+    let (_, id) = f.create_toplevel(comp, window);
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+    f.run();
+
+    let mut dims = f.connection().window(window).dims;
+    dims.x = 520;
+    dims.y = 20;
+    f.reconfigure_window(window, dims, false);
+    f.run();
+
+    place_with_niri(f, window, 500, (30., 0.));
+    f.satellite.update_window_positions_for(false);
+    f.run();
+    assert_eq!(f.connection().window(window).dims.x, 530);
+    (id, output)
+}
+
+#[test]
+fn popup_of_compositor_placed_parent_stays_where_its_client_put_it() {
+    // A window the client moved has no output offset. Once the compositor places it, its
+    // position is in its output's frame again, and the offset has to say so: a popup takes its
+    // parent's, and entering the output would otherwise shift it by the output's position, off
+    // the X screen, where X delivers it no input and the client lines its submenus up with it.
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let window = Window::new(1);
+    let (id, output) = toplevel_placed_by_niri_after_client_move(&mut f, &comp, window);
+
+    let popup = Window::new(2);
+    let (_, p_id) = f.create_popup(&comp, PopupBuilder::new(popup, window, id).x(540).y(30));
+    f.testwl.move_surface_to_output(p_id, &output);
+    f.run();
+    f.run();
+
+    assert_eq!(f.connection().window(popup).dims.x, 540);
+    assert_eq!(f.connection().window(popup).dims.y, 30);
+}
+
+#[test]
+fn popup_moves_with_a_parent_the_compositor_moved() {
+    // On screen a popup is anchored to its parent, so a parent the compositor moves takes the
+    // popup along, and X has to hear of both. Left behind, the popup's X position says it is
+    // somewhere else relative to the parent, which the next re-anchor would act on.
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let window = Window::new(1);
+    let (id, output) = toplevel_placed_by_niri_after_client_move(&mut f, &comp, window);
+
+    let popup = Window::new(2);
+    let (_, p_id) = f.create_popup(&comp, PopupBuilder::new(popup, window, id).x(540).y(30));
+    f.testwl.move_surface_to_output(p_id, &output);
+    f.run();
+    f.run();
+    let offset = f
+        .testwl
+        .get_surface_data(p_id)
+        .unwrap()
+        .popup()
+        .positioner_state
+        .offset;
+
+    // By the compositor's report.
+    place_with_niri(&mut f, window, 500, (130., 0.));
+    f.satellite.update_window_positions_for(false);
+    f.run();
+    assert_eq!(f.connection().window(window).dims.x, 630);
+    assert_eq!(f.connection().window(popup).dims.x, 640);
+
+    // By its answer to a configure, which also re-anchors the popup.
+    place_with_niri(&mut f, window, 500, (230., 0.));
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+    f.run();
+    assert_eq!(f.connection().window(window).dims.x, 730);
+    assert_eq!(f.connection().window(popup).dims.x, 740);
+    assert_eq!(
+        f.testwl
+            .get_surface_data(p_id)
+            .unwrap()
+            .popup()
+            .positioner_state
+            .offset,
+        offset
+    );
+}
