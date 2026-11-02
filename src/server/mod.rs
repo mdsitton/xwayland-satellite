@@ -786,6 +786,9 @@ impl<S: X11Selection> XConnection for NoConnection<S> {
     fn raise_to_top(&mut self, _: x::Window) {
         debug!("could not raise window to top without XWayland initialized");
     }
+    fn set_client_list(&mut self, _: &[x::Window], _: &[x::Window]) {
+        debug!("could not set the client list without XWayland initialized");
+    }
     fn set_fullscreen(&mut self, _: x::Window, _: bool) {
         debug!("could not toggle fullscreen without XWayland initialized");
     }
@@ -827,6 +830,14 @@ pub struct InnerServerState<S: X11Selection> {
     /// Focus is to be restored to the last focused toplevel on the next run.
     restore_focus_pending: bool,
     last_hovered: Option<x::Window>,
+    /// Mapped toplevels, oldest first.
+    clients: Vec<x::Window>,
+    /// Mapped toplevels, least recently focused first.
+    focus_order: Vec<x::Window>,
+    /// The stacking order last published to X.
+    published_stacking: Vec<x::Window>,
+    /// The client list needs publishing.
+    client_list_dirty: bool,
 
     xdg_wm_base: XdgWmBase,
     compositor: client::wl_compositor::WlCompositor,
@@ -939,6 +950,10 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             last_focused_toplevel: None,
             restore_focus_pending: false,
             last_hovered: None,
+            clients: Vec::new(),
+            focus_order: Vec::new(),
+            published_stacking: Vec::new(),
+            client_list_dirty: false,
             xdg_wm_base,
             compositor,
             subcompositor,
@@ -1004,7 +1019,11 @@ impl<C: XConnection> ServerState<C> {
     /// Reads window positions from niri and moves X windows to match.
     pub fn handle_niri_events(&mut self) {
         let moved = match &mut self.inner.niri {
-            Some(niri) => niri.read_events(),
+            Some(niri) => {
+                let moved = niri.read_events();
+                self.inner.client_list_dirty |= niri.take_stacking_changed();
+                moved
+            }
             None => return,
         };
 
@@ -1384,12 +1403,16 @@ impl<C: XConnection> ServerState<C> {
                 if !is_popup && action != FocusAction::None {
                     self.last_focused_toplevel = Some(window);
                 }
+                if !is_popup {
+                    self.inner.raise_client(window);
+                }
             } else if self.unfocus {
                 self.connection.focus_window(x::WINDOW_NONE, None);
             }
             self.unfocus = false;
         }
 
+        self.publish_client_list();
         self.handle_selection_events();
         self.handle_activations();
         if let Err(e) = self.queue.flush() {
@@ -1424,6 +1447,18 @@ impl<C: XConnection> ServerState<C> {
                     panic!("Failed flushing clientside events: {other:#?}");
                 }
             }
+        }
+    }
+
+    fn publish_client_list(&mut self) {
+        if !std::mem::take(&mut self.inner.client_list_dirty) {
+            return;
+        }
+        let stacking = self.inner.stacking_order();
+        if stacking != self.inner.published_stacking {
+            self.connection
+                .set_client_list(&self.inner.clients, &stacking);
+            self.inner.published_stacking = stacking;
         }
     }
 
@@ -1832,6 +1867,55 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         }
     }
 
+    /// A toplevel was given to the compositor; it counts as a client of ours from now on.
+    fn add_client(&mut self, window: x::Window) {
+        if !self.clients.contains(&window) {
+            self.clients.push(window);
+            self.focus_order.push(window);
+            self.client_list_dirty = true;
+        }
+    }
+
+    fn remove_client(&mut self, window: x::Window) {
+        if self.clients.contains(&window) {
+            self.clients.retain(|client| *client != window);
+            self.focus_order.retain(|client| *client != window);
+            self.client_list_dirty = true;
+        }
+    }
+
+    /// A toplevel was focused, which puts it above the others it shares a layer with.
+    fn raise_client(&mut self, window: x::Window) {
+        if self.focus_order.last() == Some(&window) || !self.clients.contains(&window) {
+            return;
+        }
+        self.focus_order.retain(|client| *client != window);
+        self.focus_order.push(window);
+        self.client_list_dirty = true;
+    }
+
+    /// The toplevels from the bottom of the stack to the top, as they are on screen.
+    ///
+    /// Wayland doesn't tell us the stacking order, but recently focused windows are on top of
+    /// others as a rule. niri has layers on top of that: floating windows stay above tiled ones
+    /// whichever has focus, and workspaces that aren't showing are below everything that is.
+    /// A client that uses this to tell what is under the pointer takes the first window it finds
+    /// from the top, so a window in the wrong place here takes drops meant for the one on screen.
+    fn stacking_order(&self) -> Vec<x::Window> {
+        let mut stacking = self.focus_order.clone();
+        if let Some(niri) = &self.niri {
+            // The sort is stable, so each layer stays in focus order.
+            stacking.sort_by_cached_key(|window| {
+                self.windows
+                    .get(window)
+                    .and_then(|id| self.world.get::<&client::wl_surface::WlSurface>(*id).ok())
+                    .map(|surface| niri.stacking_rank(surface.id().protocol_id()))
+                    .unwrap_or_default()
+            });
+        }
+        stacking
+    }
+
     pub fn map_window(&mut self, window: x::Window) {
         debug!("mapping {window:?}");
 
@@ -1871,6 +1955,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             }
             win.mapped = false;
         }
+        self.remove_client(window);
 
         if let Ok(mut role) = self.world.remove_one::<SurfaceRole>(entity.unwrap()) {
             role.destroy();
@@ -2053,6 +2138,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
     }
 
     pub fn destroy_window(&mut self, window: x::Window) {
+        self.remove_client(window);
         if let Some(id) = self.windows.remove(&window) {
             self.world.remove::<(x::Window, WindowData)>(id).unwrap();
             if self.world.entity(id).unwrap().is_empty() {
@@ -2159,6 +2245,9 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
 
         client.commit();
         self.world.insert(entity, (role,)).unwrap();
+        if is_toplevel {
+            self.add_client(window);
+        }
 
         is_toplevel
     }

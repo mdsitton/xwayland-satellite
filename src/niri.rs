@@ -41,6 +41,16 @@ struct Window {
     /// Whether the window is in the floating layout, which is the only one with positions that
     /// can be asked to change.
     is_floating: bool,
+    /// The workspace the window is on.
+    workspace_id: Option<u64>,
+}
+
+/// What we know about one of niri's workspaces.
+#[derive(Debug)]
+struct Workspace {
+    output: Option<String>,
+    /// Whether this is the workspace showing on its output.
+    is_active: bool,
 }
 
 /// A connection to niri's event stream, tracking where our windows are.
@@ -60,6 +70,9 @@ pub(crate) struct Niri {
     /// Our own process id, which is the one niri reports for every window we create.
     pid: i32,
     windows: HashMap<u64, Window>,
+    workspaces: HashMap<u64, Workspace>,
+    /// Something that decides the stacking order changed since this was last looked at.
+    stacking_changed: bool,
 }
 
 impl Niri {
@@ -90,6 +103,8 @@ impl Niri {
             retry_at: Some(Instant::now()),
             pid: std::process::id() as i32,
             windows: HashMap::new(),
+            workspaces: HashMap::new(),
+            stacking_changed: false,
         };
         niri.reconnect();
         Some(niri)
@@ -106,6 +121,8 @@ impl Niri {
             retry_at: None,
             pid: std::process::id() as i32,
             windows: HashMap::new(),
+            workspaces: HashMap::new(),
+            stacking_changed: false,
         };
         niri.windows.insert(
             1,
@@ -113,8 +130,29 @@ impl Niri {
                 surface_id: Some(surface_id),
                 placement: Some((output.to_owned(), position)),
                 is_floating: false,
+                workspace_id: None,
             },
         );
+        niri
+    }
+
+    /// A connection that knows only what the test tells it, as lines of niri's event stream.
+    #[cfg(test)]
+    pub(crate) fn with_events(events: &[String]) -> Self {
+        let (wake, waker) = UnixStream::pair().unwrap();
+        let mut niri = Self {
+            events: None,
+            wake,
+            waker,
+            retry_at: None,
+            pid: std::process::id() as i32,
+            windows: HashMap::new(),
+            workspaces: HashMap::new(),
+            stacking_changed: false,
+        };
+        for event in events {
+            niri.handle_event(event.as_bytes());
+        }
         niri
     }
 
@@ -169,6 +207,7 @@ impl Niri {
 
         info!("Following window positions from niri at {path:?}");
         self.windows.clear();
+        self.workspaces.clear();
         self.events = Some(rx);
     }
 
@@ -210,7 +249,7 @@ impl Niri {
     }
 
     /// Takes in one event, returning true if it moved any window.
-    fn handle_event(&mut self, line: &[u8]) -> bool {
+    pub(crate) fn handle_event(&mut self, line: &[u8]) -> bool {
         let event: Value = match serde_json::from_slice(line) {
             Ok(event) => event,
             Err(e) => {
@@ -239,8 +278,10 @@ impl Niri {
                     let mut entry = previous.remove(&id).unwrap_or_default();
                     entry.surface_id = self.our_surface_id(window);
                     entry.is_floating = is_floating(window);
+                    entry.workspace_id = workspace_id(window);
                     self.windows.insert(id, entry);
                 }
+                self.stacking_changed = true;
 
                 // Only the windows that went away could have moved anything.
                 previous.values().any(|window| window.is_ours())
@@ -255,14 +296,59 @@ impl Niri {
 
                 let surface_id = self.our_surface_id(window);
                 let floating = is_floating(window);
+                let workspace = workspace_id(window);
                 let entry = self.windows.entry(id).or_default();
                 let was_ours = entry.surface_id.is_some();
                 entry.surface_id = surface_id;
                 entry.is_floating = floating;
+                entry.workspace_id = workspace;
+                self.stacking_changed = true;
 
                 // A window of ours that just appeared has no placement yet; the geometry event
                 // that follows is what moves it.
                 was_ours != entry.surface_id.is_some()
+            }
+            "WorkspacesChanged" => {
+                // A full list, like the one for windows.
+                let workspaces = data.get("workspaces").and_then(Value::as_array);
+                let Some(workspaces) = workspaces else {
+                    return false;
+                };
+
+                self.workspaces.clear();
+                for workspace in workspaces {
+                    let Some(id) = workspace.get("id").and_then(Value::as_u64) else {
+                        continue;
+                    };
+                    let output = workspace.get("output").and_then(Value::as_str);
+                    let is_active = workspace.get("is_active").and_then(Value::as_bool);
+                    self.workspaces.insert(
+                        id,
+                        Workspace {
+                            output: output.map(str::to_owned),
+                            is_active: is_active.unwrap_or(false),
+                        },
+                    );
+                }
+                self.stacking_changed = true;
+                false
+            }
+            "WorkspaceActivated" => {
+                let Some(id) = data.get("id").and_then(Value::as_u64) else {
+                    return false;
+                };
+                let Some(output) = self.workspaces.get(&id).map(|w| w.output.clone()) else {
+                    return false;
+                };
+
+                // Each output shows one workspace, so this replaces the one on the same output.
+                for (other, workspace) in &mut self.workspaces {
+                    if workspace.output == output {
+                        workspace.is_active = *other == id;
+                    }
+                }
+                self.stacking_changed = true;
+                false
             }
             "WindowClosed" => {
                 let Some(id) = data.get("id").and_then(Value::as_u64) else {
@@ -332,6 +418,28 @@ impl Niri {
             .find(|window| window.surface_id == Some(surface_id))
             .and_then(|window| window.placement.as_ref())
             .map(|(output, position)| (output.as_str(), *position))
+    }
+
+    /// Which layer of the stack the window belonging to one of our surfaces is in: the higher the
+    /// rank, the nearer the top. A window we know nothing about is taken to be an ordinary one.
+    pub(crate) fn stacking_rank(&self, surface_id: u32) -> (bool, bool) {
+        let window = self
+            .windows
+            .values()
+            .find(|window| window.surface_id == Some(surface_id));
+        let Some(window) = window else {
+            return (true, false);
+        };
+        let showing = window
+            .workspace_id
+            .and_then(|id| self.workspaces.get(&id))
+            .is_none_or(|workspace| workspace.is_active);
+        (showing, window.is_floating)
+    }
+
+    /// Whether the stacking order may have changed since the last time this was asked.
+    pub(crate) fn take_stacking_changed(&mut self) -> bool {
+        std::mem::take(&mut self.stacking_changed)
     }
 
     /// The window one of our surfaces belongs to, if it is a floating one whose position the
@@ -409,6 +517,11 @@ fn is_floating(window: &Value) -> bool {
         .get("is_floating")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+/// The workspace niri reports this window to be on.
+fn workspace_id(window: &Value) -> Option<u64> {
+    window.get("workspace_id").and_then(Value::as_u64)
 }
 
 impl Window {

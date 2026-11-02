@@ -350,6 +350,9 @@ xcb::atoms_struct! {
     struct Atoms {
         wm_protocols => b"WM_PROTOCOLS",
         net_active_window => b"_NET_ACTIVE_WINDOW",
+        net_supported => b"_NET_SUPPORTED",
+        net_client_list => b"_NET_CLIENT_LIST",
+        net_client_list_stacking => b"_NET_CLIENT_LIST_STACKING",
         wm_delete_window => b"WM_DELETE_WINDOW",
         net_wm_state => b"_NET_WM_STATE",
         skip_taskbar => b"_NET_WM_STATE_SKIP_TASKBAR",
@@ -908,6 +911,56 @@ fn toplevel_flow() {
     f.wait_and_dispatch();
 
     assert!(!toplevel.is_alive());
+}
+
+#[test]
+fn client_list_published_on_root() {
+    // GTK's window stack comes from _NET_CLIENT_LIST_STACKING, and is empty unless _NET_SUPPORTED
+    // lists it, whatever the property says.
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+
+    let root_windows = |connection: &mut Connection, property| {
+        connection
+            .get_reply(&x::GetProperty {
+                delete: false,
+                window: connection.root,
+                property,
+                r#type: x::ATOM_WINDOW,
+                long_offset: 0,
+                long_length: 16,
+            })
+            .value::<x::Window>()
+            .to_vec()
+    };
+
+    let supported = connection.get_reply(&x::GetProperty {
+        delete: false,
+        window: connection.root,
+        property: connection.atoms.net_supported,
+        r#type: x::ATOM_ATOM,
+        long_offset: 0,
+        long_length: 32,
+    });
+    let supported = supported.value::<x::Atom>();
+    assert!(supported.contains(&connection.atoms.net_client_list));
+    assert!(supported.contains(&connection.atoms.net_client_list_stacking));
+
+    let first = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    f.map_as_toplevel(&mut connection, first);
+    let second = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    f.map_as_toplevel(&mut connection, second);
+    let (clients, stacking) = (
+        connection.atoms.net_client_list,
+        connection.atoms.net_client_list_stacking,
+    );
+    assert_eq!(root_windows(&mut connection, clients), [first, second]);
+    assert_eq!(root_windows(&mut connection, stacking), [first, second]);
+
+    connection.unmap_window(first);
+    f.wait_and_dispatch();
+    assert_eq!(root_windows(&mut connection, clients), [second]);
+    assert_eq!(root_windows(&mut connection, stacking), [second]);
 }
 
 #[test]

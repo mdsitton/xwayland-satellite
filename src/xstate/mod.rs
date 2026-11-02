@@ -290,6 +290,8 @@ impl XState {
 
         self.set_root_property(self.atoms.wm_check, x::ATOM_WINDOW, &[self.wm_window]);
         self.set_root_property(self.atoms.active_win, x::ATOM_WINDOW, &[x::Window::none()]);
+        self.set_root_property::<x::Window>(self.atoms.client_list, x::ATOM_WINDOW, &[]);
+        self.set_root_property::<x::Window>(self.atoms.client_list_stacking, x::ATOM_WINDOW, &[]);
         self.set_root_property(
             self.atoms.supported,
             x::ATOM_ATOM,
@@ -299,6 +301,8 @@ impl XState {
                 self.atoms.net_wm_state,
                 self.atoms.wm_fullscreen,
                 self.atoms.moveresize,
+                self.atoms.client_list,
+                self.atoms.client_list_stacking,
             ],
         );
 
@@ -1044,6 +1048,7 @@ xcb::atoms_struct! {
         wm_fullscreen => b"_NET_WM_STATE_FULLSCREEN" only_if_exists = false,
         active_win => b"_NET_ACTIVE_WINDOW" only_if_exists = false,
         client_list => b"_NET_CLIENT_LIST" only_if_exists = false,
+        client_list_stacking => b"_NET_CLIENT_LIST_STACKING" only_if_exists = false,
         supported => b"_NET_SUPPORTED" only_if_exists = false,
         motif_wm_hints => b"_MOTIF_WM_HINTS" only_if_exists = false,
         utf8_string => b"UTF8_STRING" only_if_exists = false,
@@ -1634,6 +1639,24 @@ impl XConnection for RealConnection {
             self.connection
                 .send_and_check_request(&x::UnmapWindow { window })
         );
+    }
+
+    fn set_client_list(&mut self, clients: &[x::Window], stacking: &[x::Window]) {
+        let root = self.root_window();
+        for (property, data) in [
+            (self.atoms.client_list, clients),
+            (self.atoms.client_list_stacking, stacking),
+        ] {
+            if let Err(e) = self.connection.send_and_check_request(&x::ChangeProperty {
+                mode: x::PropMode::Replace,
+                window: root,
+                property,
+                r#type: x::ATOM_WINDOW,
+                data,
+            }) {
+                warn!("Failed to publish the client list ({e})");
+            }
+        }
     }
 
     fn raise_to_top(&mut self, window: x::Window) {

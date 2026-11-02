@@ -32,6 +32,9 @@ pub trait XConnection: Sized + 'static {
     fn close_window(&mut self, window: x::Window);
     fn unmap_window(&mut self, window: x::Window);
     fn raise_to_top(&mut self, window: x::Window);
+    /// Publishes the mapped toplevels (`_NET_CLIENT_LIST`, oldest first) and the order they are
+    /// stacked in on screen (`_NET_CLIENT_LIST_STACKING`, bottom to top).
+    fn set_client_list(&mut self, clients: &[x::Window], stacking: &[x::Window]);
 }
 
 pub trait X11Selection {

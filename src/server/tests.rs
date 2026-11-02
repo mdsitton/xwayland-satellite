@@ -169,6 +169,8 @@ struct FakeXConnection {
     windows: HashMap<Window, WindowData>,
     set_window_dims_counter: usize,
     dims_history: Vec<(Window, WindowDims)>,
+    clients: Vec<Window>,
+    stacking: Vec<Window>,
 }
 
 impl FakeXConnection {
@@ -277,6 +279,11 @@ impl super::XConnection for FakeXConnection {
 
     fn unmap_window(&mut self, _: x::Window) {
         todo!()
+    }
+
+    fn set_client_list(&mut self, clients: &[Window], stacking: &[Window]) {
+        self.clients = clients.to_vec();
+        self.stacking = stacking.to_vec();
     }
 }
 
@@ -5791,4 +5798,144 @@ fn popup_is_not_moved_back_by_the_answer_to_an_older_move() {
     f.run();
     f.run();
     assert_eq!(f.satellite.connection.dims_history, [(popup, newer)]);
+}
+
+/// The event that tells satellite about the given windows, as (window, floating, workspace).
+fn niri_windows_event(
+    f: &mut TestFixture<FakeXConnection>,
+    windows: &[(Window, bool, u64)],
+) -> String {
+    let windows = windows
+        .iter()
+        .enumerate()
+        .map(|(id, (window, is_floating, workspace_id))| {
+            let entity = f.satellite.inner.windows[window];
+            let surface_id = f
+                .satellite
+                .inner
+                .world
+                .get::<&wayland_client::protocol::wl_surface::WlSurface>(entity)
+                .unwrap()
+                .id()
+                .protocol_id();
+            serde_json::json!({
+                "id": id,
+                "pid": std::process::id(),
+                "wl_surface_id": surface_id,
+                "is_floating": is_floating,
+                "workspace_id": workspace_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({ "WindowsChanged": { "windows": windows } }).to_string()
+}
+
+fn niri_workspaces_event() -> String {
+    serde_json::json!({ "WorkspacesChanged": { "workspaces": [
+        { "id": 1, "output": "DP-1", "is_active": true },
+        { "id": 2, "output": "DP-1", "is_active": false },
+    ] } })
+    .to_string()
+}
+
+#[test]
+fn client_list_has_mapped_toplevels_only() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let first = Window::new(1);
+    let second = Window::new(2);
+    f.create_toplevel(&comp, first);
+    let (_, id) = f.create_toplevel(&comp, second);
+    let popup = Window::new(3);
+    f.create_popup(&comp, PopupBuilder::new(popup, second, id));
+    f.run();
+    assert_eq!(f.connection().clients, [first, second]);
+    assert_eq!(f.connection().stacking.len(), 2);
+
+    f.satellite.unmap_window(first);
+    f.run();
+    assert_eq!(f.connection().clients, [second]);
+    assert_eq!(f.connection().stacking, [second]);
+
+    f.satellite.destroy_window(second);
+    f.run();
+    assert!(f.connection().clients.is_empty());
+    assert!(f.connection().stacking.is_empty());
+}
+
+#[test]
+fn client_stacking_follows_focus() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    TestObject::<WlKeyboard>::from_request(&comp.seat.obj, wl_seat::Request::GetKeyboard {});
+    let first = Window::new(1);
+    let second = Window::new(2);
+    let (_, first_id) = f.create_toplevel(&comp, first);
+    let (_, second_id) = f.create_toplevel(&comp, second);
+
+    f.testwl.focus_toplevel(second_id);
+    f.run();
+    assert_eq!(f.connection().stacking, [first, second]);
+
+    f.testwl.focus_toplevel(first_id);
+    f.run();
+    assert_eq!(f.connection().stacking, [second, first]);
+    // Stacking changes; the order of the client list is by age alone.
+    assert_eq!(f.connection().clients, [first, second]);
+}
+
+#[test]
+fn client_stacking_follows_the_layers_of_the_compositor() {
+    // Floating windows stay above tiled ones even with a tiled window focused, and a window on
+    // a workspace that isn't showing is below all of them wherever it is, or the client would
+    // send a drop meant for the window on screen to one hidden at the same coordinates.
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    TestObject::<WlKeyboard>::from_request(&comp.seat.obj, wl_seat::Request::GetKeyboard {});
+    let tiled = Window::new(1);
+    let floating = Window::new(2);
+    let hidden = Window::new(3);
+    let (_, tiled_id) = f.create_toplevel(&comp, tiled);
+    let (_, floating_id) = f.create_toplevel(&comp, floating);
+    let (_, hidden_id) = f.create_toplevel(&comp, hidden);
+
+    let windows = niri_windows_event(
+        &mut f,
+        &[(tiled, false, 1), (floating, true, 1), (hidden, false, 2)],
+    );
+    f.satellite.inner.niri = Some(crate::niri::Niri::with_events(&[
+        niri_workspaces_event(),
+        windows,
+    ]));
+
+    f.testwl.focus_toplevel(floating_id);
+    f.run();
+    f.testwl.focus_toplevel(tiled_id);
+    f.run();
+    assert_eq!(f.connection().stacking, [hidden, tiled, floating]);
+
+    // Focus only reorders windows within a layer.
+    f.testwl.focus_toplevel(hidden_id);
+    f.run();
+    assert_eq!(f.connection().stacking, [hidden, tiled, floating]);
+}
+
+#[test]
+fn client_stacking_follows_the_active_workspace() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let shown = Window::new(1);
+    let hidden = Window::new(2);
+    f.create_toplevel(&comp, shown);
+    f.create_toplevel(&comp, hidden);
+
+    let windows = niri_windows_event(&mut f, &[(shown, false, 1), (hidden, false, 2)]);
+    let niri = crate::niri::Niri::with_events(&[niri_workspaces_event(), windows]);
+    f.satellite.inner.niri = Some(niri);
+    f.satellite.inner.client_list_dirty = true;
+    f.run();
+    assert_eq!(f.connection().stacking, [hidden, shown]);
+
+    let niri = f.satellite.inner.niri.as_mut().unwrap();
+    niri.handle_event(br#"{"WorkspaceActivated":{"id":2,"focused":true}}"#);
+    assert!(niri.take_stacking_changed());
+    f.satellite.inner.client_list_dirty = true;
+    f.run();
+    assert_eq!(f.connection().stacking, [shown, hidden]);
 }
