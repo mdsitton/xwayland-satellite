@@ -4901,11 +4901,12 @@ fn popup_newer_x_resize_survives_the_older_reply_being_applied() {
     f.run();
     assert_eq!(state(&f), (v(100, 100), v(70, 50)));
 
-    // The older answer (60) is applied; the newer size stands.
+    // The older answer (60) is not written back over the newer size, which stands.
+    f.satellite.connection.dims_history.clear();
     f.testwl.release_staged_configure();
     f.run();
     f.run();
-    assert_eq!(f.connection().window(popup).dims.width, 60);
+    assert_eq!(f.satellite.connection.dims_history, []);
     f.testwl.configure_toplevel(id, 110, 100, vec![]);
     f.run();
     f.run();
@@ -5750,4 +5751,44 @@ fn popup_moves_with_a_parent_the_compositor_moved() {
             .offset,
         offset
     );
+}
+
+#[test]
+fn popup_is_not_moved_back_by_the_answer_to_an_older_move() {
+    // A client moving a popup along with the pointer has usually asked for the next position by
+    // the time the compositor answers the last one. Written to X, that answer would be reported
+    // back after the client's newer position, as if the client had moved the popup back again.
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let (_, output) = f.new_output(0, 0);
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, window);
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+    let popup = Window::new(2);
+    let (_, p_id) = f.create_popup(&comp, PopupBuilder::new(popup, window, id).x(20).y(20));
+    f.testwl.move_surface_to_output(p_id, &output);
+    f.run();
+    let dims = f.connection().window(popup).dims;
+    let older = WindowDims { x: 30, ..dims };
+    let newer = WindowDims { x: 40, ..dims };
+
+    f.testwl.hold_reposition_replies(true);
+    f.reconfigure_window(popup, older, true);
+    f.run();
+    f.satellite.popup_geometry_requested(popup, newer);
+    f.satellite.connection.dims_history.clear();
+
+    // The answer to the older move comes before X reports the newer one.
+    assert!(f.testwl.release_reposition_reply());
+    f.run();
+    f.run();
+    assert_eq!(f.satellite.connection.dims_history, []);
+
+    // Once X has, that is the geometry the compositor is asked for and answers.
+    f.reconfigure_window(popup, newer, true);
+    f.run();
+    assert!(f.testwl.release_reposition_reply());
+    f.run();
+    f.run();
+    assert_eq!(f.satellite.connection.dims_history, [(popup, newer)]);
 }

@@ -458,6 +458,8 @@ struct PopupData {
     /// window's geometry, which a configure answering an older request (the initial one, or
     /// one in flight when the client resized) may have replaced in the meantime.
     client_geometry: Option<ClientGeometry>,
+    /// The X geometry the client has asked for and X has yet to report back.
+    client_requested: Option<WindowDims>,
     /// The parent's future window geometry (content plus titlebar) to constrain against, and
     /// the parent's configure serial a reposition responds to, if any.
     parent_size: Option<(i32, i32)>,
@@ -518,6 +520,15 @@ impl PopupData {
             }
             self.pending_requests.drain(..=index);
         }
+    }
+
+    /// Whether the client has given the popup a geometry newer than any the next configure can
+    /// answer. A client moving a popup along with the pointer usually has by the time the answer
+    /// to its last move comes in, and X has the newer geometry. Writing the older one back would
+    /// not just move the popup back: it would come back from X looking like one more move by the
+    /// client, and the popup would be repositioned there and stay.
+    fn superseded_by_client(&self) -> bool {
+        self.client_requested.is_some() || self.client_geometry.is_some_and(|g| !g.answered)
     }
 
     /// The configure answering a reposition was applied to the X window.
@@ -1696,6 +1707,20 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         true
     }
 
+    /// The X client asked for a popup geometry that will be reported back once X has applied it.
+    pub fn popup_geometry_requested(&mut self, window: x::Window, dims: WindowDims) {
+        let Some(mut role) = self
+            .windows
+            .get(&window)
+            .and_then(|id| self.world.get::<&mut SurfaceRole>(*id).ok())
+        else {
+            return;
+        };
+        if let SurfaceRole::Popup(Some(popup)) = &mut *role {
+            popup.client_requested = Some(dims);
+        }
+    }
+
     pub fn reconfigure_window(&mut self, event: x::ConfigureNotifyEvent) {
         let Some((mut win, data)) = self
             .windows
@@ -1714,6 +1739,12 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             width: event.width(),
             height: event.height(),
         };
+        if let Some(SurfaceRole::Popup(Some(popup))) = data.get::<&mut SurfaceRole>().as_deref_mut()
+        {
+            if popup.client_requested == Some(dims) {
+                popup.client_requested = None;
+            }
+        }
         if dims == win.attrs.dims {
             return;
         } else if win.attrs.role.is_popup() {
@@ -2519,6 +2550,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             request,
             sent: request,
             client_geometry: None,
+            client_requested: None,
             parent_size: None,
             parent_configure: None,
             configure_request: request,

@@ -300,8 +300,12 @@ impl SurfaceEvents {
 
         let pending = xdg.pending.take();
         drop(xdg);
+        let superseded = matches!(
+            &*data.get::<&SurfaceRole>().unwrap(),
+            SurfaceRole::Popup(Some(popup)) if popup.superseded_by_client()
+        );
 
-        if let Some(pending) = pending {
+        if let Some(pending) = pending.filter(|_| !superseded) {
             // A popup's configure is interpreted with the request it answers. Its position is
             // relative to the parent's window geometry, in the parent's logical coordinates;
             // its size is in the popup's own. A configure that echoes the request restores the

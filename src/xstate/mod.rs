@@ -577,6 +577,8 @@ impl XState {
                     };
                     let mut x = geometry.x();
                     let mut y = geometry.y();
+                    let mut width = geometry.width();
+                    let mut height = geometry.height();
                     let mut resized = false;
                     for value in &list {
                         match value {
@@ -584,12 +586,25 @@ impl XState {
                             x::ConfigWindow::Y(v) => y = *v as i16,
                             x::ConfigWindow::Width(w) => {
                                 resized |= *w != u32::from(geometry.width());
+                                width = *w as u16;
                             }
                             x::ConfigWindow::Height(h) => {
                                 resized |= *h != u32::from(geometry.height());
+                                height = *h as u16;
                             }
                             _ => {}
                         }
+                    }
+                    if resized || (x, y) != (geometry.x(), geometry.y()) {
+                        server_state.popup_geometry_requested(
+                            e.window(),
+                            WindowDims {
+                                x,
+                                y,
+                                width,
+                                height,
+                            },
+                        );
                     }
                     if !resized {
                         let border_width = self
