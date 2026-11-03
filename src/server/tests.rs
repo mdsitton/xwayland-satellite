@@ -5800,6 +5800,65 @@ fn popup_is_not_moved_back_by_the_answer_to_an_older_move() {
     assert_eq!(f.satellite.connection.dims_history, [(popup, newer)]);
 }
 
+#[test]
+fn popup_moved_while_a_button_is_held_is_not_kept_on_screen() {
+    // A drag image goes where the client puts it. Slid back on screen by the compositor, it would
+    // stop following the pointer once it reached an edge.
+    use wayland_protocols::xdg::shell::server::xdg_positioner::ConstraintAdjustment;
+
+    const BTN_LEFT: u32 = 272;
+    let slide = ConstraintAdjustment::SlideX | ConstraintAdjustment::SlideY;
+
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let (_, output) = f.new_output(0, 0);
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, window);
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+    let popup = Window::new(2);
+    let (_, p_id) = f.create_popup(&comp, PopupBuilder::new(popup, window, id).x(20).y(20));
+    f.testwl.move_surface_to_output(p_id, &output);
+    f.run();
+    let dims = f.connection().window(popup).dims;
+
+    let adjustment = |f: &TestFixture<FakeXConnection>| {
+        let data = f.testwl.get_surface_data(p_id).unwrap();
+        data.popup().positioner_state.constraint_adjustment
+    };
+    assert_eq!(adjustment(&f), slide);
+
+    // Moved with no button held, as a menu that adjusts itself might be.
+    let unheld = WindowDims { x: 30, ..dims };
+    f.reconfigure_window(popup, unheld, true);
+    f.run();
+    f.run();
+    assert_eq!(adjustment(&f), slide);
+
+    // Resized while a button is held, without moving.
+    f.satellite.inner.pressed_buttons.insert(BTN_LEFT);
+    let resized = WindowDims {
+        width: 60,
+        ..unheld
+    };
+    f.reconfigure_window(popup, resized, true);
+    f.run();
+    f.run();
+    assert_eq!(adjustment(&f), slide);
+
+    // Moved while a button is held.
+    f.reconfigure_window(popup, WindowDims { x: 40, ..resized }, true);
+    f.run();
+    f.run();
+    assert_eq!(adjustment(&f), ConstraintAdjustment::empty());
+
+    // It is still a drag image for what remains of its life.
+    f.satellite.inner.pressed_buttons.remove(&BTN_LEFT);
+    f.reconfigure_window(popup, WindowDims { x: 50, ..resized }, true);
+    f.run();
+    f.run();
+    assert_eq!(adjustment(&f), ConstraintAdjustment::empty());
+}
+
 /// The event that tells satellite about the given windows, as (window, floating, workspace).
 fn niri_windows_event(
     f: &mut TestFixture<FakeXConnection>,

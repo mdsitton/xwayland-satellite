@@ -470,6 +470,9 @@ struct PopupData {
     /// Requests of repositions not yet answered, by token.
     pending_requests: Vec<(u32, PopupRequest)>,
     next_reposition_token: u32,
+    /// The client moves this popup along with a held pointer, which makes it a drag image: it
+    /// belongs where the client puts it, even if that is partly off screen.
+    dragged: bool,
 }
 
 impl PopupData {
@@ -483,6 +486,7 @@ impl PopupData {
             self.request.anchor_size,
             self.parent_size,
             self.parent_configure,
+            self.dragged,
         );
     }
 
@@ -542,7 +546,9 @@ impl PopupData {
 }
 
 /// Sets a positioner up for a popup of the given logical size at `offset` from the anchor
-/// rect, which is the parent's X content area within its window geometry.
+/// rect, which is the parent's X content area within its window geometry. The compositor slides
+/// the popup to keep it on screen, unless it is one being dragged.
+#[allow(clippy::too_many_arguments)]
 fn set_up_positioner(
     positioner: &XdgPositioner,
     size: (i32, i32),
@@ -551,6 +557,7 @@ fn set_up_positioner(
     anchor_size: (i32, i32),
     parent_size: Option<(i32, i32)>,
     parent_configure: Option<u32>,
+    dragged: bool,
 ) {
     positioner.set_size(size.0, size.1);
     positioner.set_offset(offset.0, offset.1);
@@ -562,8 +569,11 @@ fn set_up_positioner(
         anchor_size.0,
         anchor_size.1,
     );
-    positioner
-        .set_constraint_adjustment(ConstraintAdjustment::SlideX | ConstraintAdjustment::SlideY);
+    positioner.set_constraint_adjustment(if dragged {
+        ConstraintAdjustment::empty()
+    } else {
+        ConstraintAdjustment::SlideX | ConstraintAdjustment::SlideY
+    });
     if let Some((width, height)) = parent_size {
         positioner.set_parent_size(width, height);
     }
@@ -1782,7 +1792,9 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         }
         if dims == win.attrs.dims {
             return;
-        } else if win.attrs.role.is_popup() {
+        }
+        let moved = (dims.x, dims.y) != (win.attrs.dims.x, win.attrs.dims.y);
+        if win.attrs.role.is_popup() {
             win.attrs.dims = dims;
         }
 
@@ -1841,6 +1853,9 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                 if !popup.xdg.mapped {
                     return;
                 }
+                // Anything satellite moved itself has the position it reports already, so this
+                // is the client. Menus and tooltips stay put once shown.
+                popup.dragged |= moved && !self.pressed_buttons.is_empty();
                 popup.request.update_geometry(
                     (dims, popup_offset),
                     parent,
@@ -2624,6 +2639,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             request.anchor_size,
             None,
             None,
+            false,
         );
         let popup = xdg.get_popup(
             Some(&parent_role.xdg().unwrap().surface),
@@ -2645,6 +2661,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             configure_request: request,
             pending_requests: Vec::new(),
             next_reposition_token: 1,
+            dragged: false,
             xdg: XdgSurfaceData {
                 surface: xdg,
                 configured: false,
